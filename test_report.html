@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Тестовый отчёт</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+  <style>
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #FFFFFF;
+      color: #1A1A1A;
+      font-family: Inter, -apple-system, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+    }
+
+    .ea-report {
+      position: relative;
+      width: 1200px;
+      min-height: 100vh;
+      margin: 0 auto;
+      background: #FFFFFF;
+    }
+
+    .ea-page-title {
+      padding: 24px 30px 10px;
+      font-size: 26px;
+      font-weight: 700;
+      color: #1A1A1A;
+    }
+
+    .ea-canvas {
+      position: relative;
+      width: 100%;
+      min-height: 800px;
+    }
+
+    /* ── Блоки ── */
+
+    .ea-block {
+      position: absolute;
+      background: #FFFFFF;
+      border: 1px solid rgba(0,0,0,0.06);
+      border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      overflow: hidden;
+      padding: 10px;
+    }
+
+    .ea-chart-canvas {
+      width: 100%;
+      height: 100%;
+      min-height: 200px;
+    }
+
+    /* KPI */
+    .ea-kpi {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 20px 24px;
+    }
+    .ea-kpi-title {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+      color: #8B93A7;
+      margin-bottom: 6px;
+    }
+    .ea-kpi-value {
+      font-weight: 700;
+      line-height: 1.1;
+    }
+    .ea-kpi-subtitle {
+      font-size: 12px;
+      color: #8B93A7;
+      margin-top: 4px;
+    }
+
+    /* Таблица */
+    .ea-table { padding: 0; overflow: auto; }
+    .ea-table-el {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .ea-table-el th {
+      background: #F5F7FA;
+      color: #1A1A1A;
+      font-weight: 600;
+      text-align: left;
+      padding: 8px 12px;
+      border-bottom: 1px solid rgba(0,0,0,0.08);
+      position: sticky; top: 0;
+    }
+    .ea-table-el td {
+      padding: 6px 12px;
+      border-bottom: 1px solid rgba(0,0,0,0.04);
+    }
+    .ea-table-el.ea-striped tr:nth-child(even) td {
+      background: rgba(0,0,0,0.02);
+    }
+
+    /* Текст */
+    .ea-text { padding: 16px 20px; }
+    .ea-text-content h1 { font-size: 22px; margin: 8px 0 12px; }
+    .ea-text-content h2 { font-size: 17px; margin: 8px 0 10px; }
+    .ea-text-content p  { margin: 6px 0; }
+    .ea-text-content ul { margin: 6px 0 6px 20px; padding: 0; }
+    .ea-text-content li { margin: 2px 0; }
+
+    /* Заглушки */
+    .ea-empty, .ea-error {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #F5F7FA;
+      color: #8B93A7;
+      font-size: 12px;
+      text-align: center;
+      border: 1px dashed rgba(0,0,0,0.12);
+    }
+    .ea-error { color: #b91c1c; background: #fef2f2; border-color: #fecaca; }
+    .ea-error-msg { padding: 16px; font-family: monospace; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <div class="ea-report" id="ea-report">
+    <div class="ea-page-title">Тестовый отчёт</div>
+    <div class="ea-canvas" id="ea-canvas">
+      ['\n<div class="ea-block ea-kpi" data-block-id="blk_33fe4d2a" style="left: 20px; top: 20px; width: 280px; height: 120px; z-index: 0">\n  <div class="ea-kpi-title">Всего продаж</div>\n  <div class="ea-kpi-value" style="color: #87C800; font-size: 32px;">1960 ₽</div>\n  \n</div>\n', '\n<div class="ea-block ea-chart" data-block-id="blk_a4caea3a" style="left: 320px; top: 20px; width: 600px; height: 320px; z-index: 1">\n  <div id="plot_blk_a4caea3a" class="ea-chart-canvas"></div>\n  <script>\n    (function() {\n      var el = document.getElementById("plot_blk_a4caea3a");\n      if (el && window.Plotly) {\n        Plotly.newPlot(el, {"data": [{"line": {"color": "#87C800", "width": 2}, "marker": {"size": 6}, "mode": "lines+markers", "name": "Продажи", "x": ["2024-01-01T00:00:00.000000", "2024-01-02T00:00:00.000000", "2024-01-03T00:00:00.000000", "2024-01-04T00:00:00.000000", "2024-01-05T00:00:00.000000", "2024-01-06T00:00:00.000000", "2024-01-07T00:00:00.000000", "2024-01-08T00:00:00.000000", "2024-01-09T00:00:00.000000", "2024-01-10T00:00:00.000000"], "y": {"dtype": "i2", "bdata": "ZACWAHgAyAC0ANwAvgDwAAQBLAE="}, "type": "scatter"}], "layout": {"template": {"data": {"histogram2dcontour": [{"type": "histogram2dcontour", "colorbar": {"outlinewidth": 0, "ticks": ""}, "colorscale": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]]}], "choropleth": [{"type": "choropleth", "colorbar": {"outlinewidth": 0, "ticks": ""}}], "histogram2d": [{"type": "histogram2d", "colorbar": {"outlinewidth": 0, "ticks": ""}, "colorscale": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]]}], "heatmap": [{"type": "heatmap", "colorbar": {"outlinewidth": 0, "ticks": ""}, "colorscale": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]]}], "contourcarpet": [{"type": "contourcarpet", "colorbar": {"outlinewidth": 0, "ticks": ""}}], "contour": [{"type": "contour", "colorbar": {"outlinewidth": 0, "ticks": ""}, "colorscale": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]]}], "surface": [{"type": "surface", "colorbar": {"outlinewidth": 0, "ticks": ""}, "colorscale": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]]}], "mesh3d": [{"type": "mesh3d", "colorbar": {"outlinewidth": 0, "ticks": ""}}], "scatter": [{"fillpattern": {"fillmode": "overlay", "size": 10, "solidity": 0.2}, "type": "scatter"}], "parcoords": [{"type": "parcoords", "line": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scatterpolargl": [{"type": "scatterpolargl", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "bar": [{"error_x": {"color": "#2a3f5f"}, "error_y": {"color": "#2a3f5f"}, "marker": {"line": {"color": "#E5ECF6", "width": 0.5}, "pattern": {"fillmode": "overlay", "size": 10, "solidity": 0.2}}, "type": "bar"}], "scattergeo": [{"type": "scattergeo", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scatterpolar": [{"type": "scatterpolar", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "histogram": [{"marker": {"pattern": {"fillmode": "overlay", "size": 10, "solidity": 0.2}}, "type": "histogram"}], "scattergl": [{"type": "scattergl", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scatter3d": [{"type": "scatter3d", "line": {"colorbar": {"outlinewidth": 0, "ticks": ""}}, "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scattermap": [{"type": "scattermap", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scatterternary": [{"type": "scatterternary", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scattercarpet": [{"type": "scattercarpet", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "carpet": [{"aaxis": {"endlinecolor": "#2a3f5f", "gridcolor": "white", "linecolor": "white", "minorgridcolor": "white", "startlinecolor": "#2a3f5f"}, "baxis": {"endlinecolor": "#2a3f5f", "gridcolor": "white", "linecolor": "white", "minorgridcolor": "white", "startlinecolor": "#2a3f5f"}, "type": "carpet"}], "table": [{"cells": {"fill": {"color": "#EBF0F8"}, "line": {"color": "white"}}, "header": {"fill": {"color": "#C8D4E3"}, "line": {"color": "white"}}, "type": "table"}], "barpolar": [{"marker": {"line": {"color": "#E5ECF6", "width": 0.5}, "pattern": {"fillmode": "overlay", "size": 10, "solidity": 0.2}}, "type": "barpolar"}], "pie": [{"automargin": true, "type": "pie"}]}, "layout": {"autotypenumbers": "strict", "colorway": ["#636efa", "#EF553B", "#00cc96", "#ab63fa", "#FFA15A", "#19d3f3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52"], "font": {"color": "#2a3f5f"}, "hovermode": "closest", "hoverlabel": {"align": "left"}, "paper_bgcolor": "white", "plot_bgcolor": "#E5ECF6", "polar": {"bgcolor": "#E5ECF6", "angularaxis": {"gridcolor": "white", "linecolor": "white", "ticks": ""}, "radialaxis": {"gridcolor": "white", "linecolor": "white", "ticks": ""}}, "ternary": {"bgcolor": "#E5ECF6", "aaxis": {"gridcolor": "white", "linecolor": "white", "ticks": ""}, "baxis": {"gridcolor": "white", "linecolor": "white", "ticks": ""}, "caxis": {"gridcolor": "white", "linecolor": "white", "ticks": ""}}, "coloraxis": {"colorbar": {"outlinewidth": 0, "ticks": ""}}, "colorscale": {"sequential": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]], "sequentialminus": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]], "diverging": [[0, "#8e0152"], [0.1, "#c51b7d"], [0.2, "#de77ae"], [0.3, "#f1b6da"], [0.4, "#fde0ef"], [0.5, "#f7f7f7"], [0.6, "#e6f5d0"], [0.7, "#b8e186"], [0.8, "#7fbc41"], [0.9, "#4d9221"], [1, "#276419"]]}, "xaxis": {"gridcolor": "white", "linecolor": "white", "ticks": "", "title": {"standoff": 15}, "zerolinecolor": "white", "automargin": true, "zerolinewidth": 2}, "yaxis": {"gridcolor": "white", "linecolor": "white", "ticks": "", "title": {"standoff": 15}, "zerolinecolor": "white", "automargin": true, "zerolinewidth": 2}, "scene": {"xaxis": {"backgroundcolor": "#E5ECF6", "gridcolor": "white", "linecolor": "white", "showbackground": true, "ticks": "", "zerolinecolor": "white", "gridwidth": 2}, "yaxis": {"backgroundcolor": "#E5ECF6", "gridcolor": "white", "linecolor": "white", "showbackground": true, "ticks": "", "zerolinecolor": "white", "gridwidth": 2}, "zaxis": {"backgroundcolor": "#E5ECF6", "gridcolor": "white", "linecolor": "white", "showbackground": true, "ticks": "", "zerolinecolor": "white", "gridwidth": 2}}, "shapedefaults": {"line": {"color": "#2a3f5f"}}, "annotationdefaults": {"arrowcolor": "#2a3f5f", "arrowhead": 0, "arrowwidth": 1}, "geo": {"bgcolor": "white", "landcolor": "#E5ECF6", "subunitcolor": "white", "showland": true, "showlakes": true, "lakecolor": "white"}, "title": {"x": 0.05}}}, "margin": {"l": 40, "r": 20, "t": 40, "b": 40}, "font": {"family": "Inter, sans-serif", "size": 12, "color": "#E6EBF2"}, "title": {"font": {"size": 14}, "text": "Продажи по датам", "x": 0.01, "xanchor": "left"}, "xaxis": {"title": {}, "gridcolor": "rgba(255,255,255,0.06)", "zeroline": false}, "yaxis": {"title": {}, "gridcolor": "rgba(255,255,255,0.06)", "zeroline": false}, "paper_bgcolor": "rgba(0,0,0,0)", "plot_bgcolor": "rgba(0,0,0,0)", "showlegend": true, "hovermode": "closest"}}.data, {"data": [{"line": {"color": "#87C800", "width": 2}, "marker": {"size": 6}, "mode": "lines+markers", "name": "Продажи", "x": ["2024-01-01T00:00:00.000000", "2024-01-02T00:00:00.000000", "2024-01-03T00:00:00.000000", "2024-01-04T00:00:00.000000", "2024-01-05T00:00:00.000000", "2024-01-06T00:00:00.000000", "2024-01-07T00:00:00.000000", "2024-01-08T00:00:00.000000", "2024-01-09T00:00:00.000000", "2024-01-10T00:00:00.000000"], "y": {"dtype": "i2", "bdata": "ZACWAHgAyAC0ANwAvgDwAAQBLAE="}, "type": "scatter"}], "layout": {"template": {"data": {"histogram2dcontour": [{"type": "histogram2dcontour", "colorbar": {"outlinewidth": 0, "ticks": ""}, "colorscale": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]]}], "choropleth": [{"type": "choropleth", "colorbar": {"outlinewidth": 0, "ticks": ""}}], "histogram2d": [{"type": "histogram2d", "colorbar": {"outlinewidth": 0, "ticks": ""}, "colorscale": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]]}], "heatmap": [{"type": "heatmap", "colorbar": {"outlinewidth": 0, "ticks": ""}, "colorscale": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]]}], "contourcarpet": [{"type": "contourcarpet", "colorbar": {"outlinewidth": 0, "ticks": ""}}], "contour": [{"type": "contour", "colorbar": {"outlinewidth": 0, "ticks": ""}, "colorscale": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]]}], "surface": [{"type": "surface", "colorbar": {"outlinewidth": 0, "ticks": ""}, "colorscale": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]]}], "mesh3d": [{"type": "mesh3d", "colorbar": {"outlinewidth": 0, "ticks": ""}}], "scatter": [{"fillpattern": {"fillmode": "overlay", "size": 10, "solidity": 0.2}, "type": "scatter"}], "parcoords": [{"type": "parcoords", "line": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scatterpolargl": [{"type": "scatterpolargl", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "bar": [{"error_x": {"color": "#2a3f5f"}, "error_y": {"color": "#2a3f5f"}, "marker": {"line": {"color": "#E5ECF6", "width": 0.5}, "pattern": {"fillmode": "overlay", "size": 10, "solidity": 0.2}}, "type": "bar"}], "scattergeo": [{"type": "scattergeo", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scatterpolar": [{"type": "scatterpolar", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "histogram": [{"marker": {"pattern": {"fillmode": "overlay", "size": 10, "solidity": 0.2}}, "type": "histogram"}], "scattergl": [{"type": "scattergl", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scatter3d": [{"type": "scatter3d", "line": {"colorbar": {"outlinewidth": 0, "ticks": ""}}, "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scattermap": [{"type": "scattermap", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scatterternary": [{"type": "scatterternary", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "scattercarpet": [{"type": "scattercarpet", "marker": {"colorbar": {"outlinewidth": 0, "ticks": ""}}}], "carpet": [{"aaxis": {"endlinecolor": "#2a3f5f", "gridcolor": "white", "linecolor": "white", "minorgridcolor": "white", "startlinecolor": "#2a3f5f"}, "baxis": {"endlinecolor": "#2a3f5f", "gridcolor": "white", "linecolor": "white", "minorgridcolor": "white", "startlinecolor": "#2a3f5f"}, "type": "carpet"}], "table": [{"cells": {"fill": {"color": "#EBF0F8"}, "line": {"color": "white"}}, "header": {"fill": {"color": "#C8D4E3"}, "line": {"color": "white"}}, "type": "table"}], "barpolar": [{"marker": {"line": {"color": "#E5ECF6", "width": 0.5}, "pattern": {"fillmode": "overlay", "size": 10, "solidity": 0.2}}, "type": "barpolar"}], "pie": [{"automargin": true, "type": "pie"}]}, "layout": {"autotypenumbers": "strict", "colorway": ["#636efa", "#EF553B", "#00cc96", "#ab63fa", "#FFA15A", "#19d3f3", "#FF6692", "#B6E880", "#FF97FF", "#FECB52"], "font": {"color": "#2a3f5f"}, "hovermode": "closest", "hoverlabel": {"align": "left"}, "paper_bgcolor": "white", "plot_bgcolor": "#E5ECF6", "polar": {"bgcolor": "#E5ECF6", "angularaxis": {"gridcolor": "white", "linecolor": "white", "ticks": ""}, "radialaxis": {"gridcolor": "white", "linecolor": "white", "ticks": ""}}, "ternary": {"bgcolor": "#E5ECF6", "aaxis": {"gridcolor": "white", "linecolor": "white", "ticks": ""}, "baxis": {"gridcolor": "white", "linecolor": "white", "ticks": ""}, "caxis": {"gridcolor": "white", "linecolor": "white", "ticks": ""}}, "coloraxis": {"colorbar": {"outlinewidth": 0, "ticks": ""}}, "colorscale": {"sequential": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]], "sequentialminus": [[0.0, "#0d0887"], [0.1111111111111111, "#46039f"], [0.2222222222222222, "#7201a8"], [0.3333333333333333, "#9c179e"], [0.4444444444444444, "#bd3786"], [0.5555555555555556, "#d8576b"], [0.6666666666666666, "#ed7953"], [0.7777777777777778, "#fb9f3a"], [0.8888888888888888, "#fdca26"], [1.0, "#f0f921"]], "diverging": [[0, "#8e0152"], [0.1, "#c51b7d"], [0.2, "#de77ae"], [0.3, "#f1b6da"], [0.4, "#fde0ef"], [0.5, "#f7f7f7"], [0.6, "#e6f5d0"], [0.7, "#b8e186"], [0.8, "#7fbc41"], [0.9, "#4d9221"], [1, "#276419"]]}, "xaxis": {"gridcolor": "white", "linecolor": "white", "ticks": "", "title": {"standoff": 15}, "zerolinecolor": "white", "automargin": true, "zerolinewidth": 2}, "yaxis": {"gridcolor": "white", "linecolor": "white", "ticks": "", "title": {"standoff": 15}, "zerolinecolor": "white", "automargin": true, "zerolinewidth": 2}, "scene": {"xaxis": {"backgroundcolor": "#E5ECF6", "gridcolor": "white", "linecolor": "white", "showbackground": true, "ticks": "", "zerolinecolor": "white", "gridwidth": 2}, "yaxis": {"backgroundcolor": "#E5ECF6", "gridcolor": "white", "linecolor": "white", "showbackground": true, "ticks": "", "zerolinecolor": "white", "gridwidth": 2}, "zaxis": {"backgroundcolor": "#E5ECF6", "gridcolor": "white", "linecolor": "white", "showbackground": true, "ticks": "", "zerolinecolor": "white", "gridwidth": 2}}, "shapedefaults": {"line": {"color": "#2a3f5f"}}, "annotationdefaults": {"arrowcolor": "#2a3f5f", "arrowhead": 0, "arrowwidth": 1}, "geo": {"bgcolor": "white", "landcolor": "#E5ECF6", "subunitcolor": "white", "showland": true, "showlakes": true, "lakecolor": "white"}, "title": {"x": 0.05}}}, "margin": {"l": 40, "r": 20, "t": 40, "b": 40}, "font": {"family": "Inter, sans-serif", "size": 12, "color": "#E6EBF2"}, "title": {"font": {"size": 14}, "text": "Продажи по датам", "x": 0.01, "xanchor": "left"}, "xaxis": {"title": {}, "gridcolor": "rgba(255,255,255,0.06)", "zeroline": false}, "yaxis": {"title": {}, "gridcolor": "rgba(255,255,255,0.06)", "zeroline": false}, "paper_bgcolor": "rgba(0,0,0,0)", "plot_bgcolor": "rgba(0,0,0,0)", "showlegend": true, "hovermode": "closest"}}.layout, {\n          responsive: true,\n          displayModeBar: false,\n          displaylogo: false\n        });\n      }\n    })();\n  </script>\n</div>\n', '\n<div class="ea-block ea-table" data-block-id="blk_76ed73a5" style="left: 20px; top: 180px; width: 280px; height: 200px; z-index: 2">\n  <table class="ea-table-el ea-striped">\n    <thead><tr><th>Дата</th><th>Продажи</th></tr></thead>\n    <tbody><tr><td>2024-01-01 00:00:00</td><td>100</td></tr><tr><td>2024-01-02 00:00:00</td><td>150</td></tr><tr><td>2024-01-03 00:00:00</td><td>120</td></tr><tr><td>2024-01-04 00:00:00</td><td>200</td></tr><tr><td>2024-01-05 00:00:00</td><td>180</td></tr><tr><td>2024-01-06 00:00:00</td><td>220</td></tr><tr><td>2024-01-07 00:00:00</td><td>190</td></tr><tr><td>2024-01-08 00:00:00</td><td>240</td></tr><tr><td>2024-01-09 00:00:00</td><td>260</td></tr><tr><td>2024-01-10 00:00:00</td><td>300</td></tr></tbody>\n  </table>\n</div>\n', '\n<div class="ea-block ea-text" data-block-id="blk_9a925486" style="left: 20px; top: 400px; width: 400px; height: 150px; z-index: 3">\n  <div class="ea-text-content" style="text-align: left; font-size: 14px;">\n    <h2>Заголовок</h2>\n<br>\n<p>Это тестовый отчёт.</p>\n<ul>\n<li>Пункт 1</li>\n<li>Пункт 2</li>\n</ul>\n  </div>\n</div>\n']
+    </div>
+  </div>
+
+  <script>
+    // Пересчёт высоты canvas при resize
+    (function() {
+      function fixCanvasHeight() {
+        var canvas = document.getElementById('ea-canvas');
+        if (!canvas) return;
+        var blocks = canvas.querySelectorAll('.ea-block');
+        var maxBottom = 0;
+        for (var i = 0; i < blocks.length; i++) {
+          var b = blocks[i];
+          var top = parseInt(b.style.top) || 0;
+          var h = parseInt(b.style.height) || 0;
+          maxBottom = Math.max(maxBottom, top + h);
+        }
+        canvas.style.minHeight = Math.max(800, maxBottom + 40) + 'px';
+      }
+
+      // Plotly дорисовывается асинхронно, поэтому пересчитываем после
+      // небольшой задержки и при каждой загрузке
+      window.addEventListener('load', function() {
+        setTimeout(fixCanvasHeight, 100);
+        setTimeout(fixCanvasHeight, 500);
+      });
+      window.addEventListener('resize', fixCanvasHeight);
+    })();
+  </script>
+</body>
+</html>

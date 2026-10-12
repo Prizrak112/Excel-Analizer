@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: #f5f7f9;
+            color: #333;
+            padding: 40px;
+            margin: 0;
+        }
+        h1 {
+            color: #003F0B;
+            border-bottom: 2px solid #87C800;
+            padding-bottom: 12px;
+            margin-top: 0;
+        }
+        .card {
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 15px 0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        button {
+            background: #87C800;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            margin: 5px 5px 5px 0;
+        }
+        button:hover {
+            background: #6ea800;
+        }
+        #output {
+            background: #f1f7f1;
+            border-left: 3px solid #87C800;
+            padding: 12px 16px;
+            margin-top: 15px;
+            border-radius: 4px;
+            font-family: 'Consolas', monospace;
+            font-size: 13px;
+            color: #003F0B;
+            min-height: 20px;
+        }
+        .status {
+            color: #888;
+            font-size: 12px;
+            margin-bottom: 15px;
+            padding: 6px 10px;
+            background: #f5f5f5;
+            border-radius: 4px;
+        }
+        .status.ok {
+            color: #009128;
+            background: #e8f5e8;
+        }
+    </style>
+</head>
+<body>
+    <h1>🌉 Мост JS ↔ Python</h1>
+    
+    <div class="card">
+        <div class="status" id="status">⏳ Подключение к Python...</div>
+        
+        <p><b>Тест 1: Python возвращает строку</b></p>
+        <button onclick="testHello()">Сказать "Привет"</button>
+        
+        <p style="margin-top: 20px;"><b>Тест 2: число → Python → число+1</b></p>
+        <button onclick="testAdd()">Отправить число 41</button>
+        
+        <p style="margin-top: 20px;"><b>Тест 3: узнать информацию о приложении</b></p>
+        <button onclick="testInfo()">Информация о среде</button>
+        
+        <p style="margin-top: 20px;"><b>Тест 4: лог в консоль Python</b></p>
+        <button onclick="testLog()">Отправить лог в Python</button>
+        
+        <div id="output">Здесь появится ответ...</div>
+    </div>
+    
+    <script>
+        var bridge = null;
+        
+        // Подключаемся к Python через QWebChannel
+        new QWebChannel(qt.webChannelTransport, function(channel) {
+            bridge = channel.objects.bridge;
+            var statusEl = document.getElementById('status');
+            statusEl.textContent = '✅ Подключено к Python!';
+            statusEl.className = 'status ok';
+        });
+        
+        function setOutput(text) {
+            document.getElementById('output').textContent = text;
+        }
+        
+        function testHello() {
+            if (!bridge) return setOutput('❌ Мост не готов');
+            bridge.hello_from_python('Мир', function(result) {
+                setOutput('✅ ' + result);
+            });
+        }
+        
+        function testAdd() {
+            if (!bridge) return setOutput('❌ Мост не готов');
+            bridge.add(41, function(result) {
+                setOutput('✅ Python вернул: ' + result + ' (было 41)');
+            });
+        }
+        
+        function testInfo() {
+            if (!bridge) return setOutput('❌ Мост не готов');
+            bridge.get_app_info(function(result) {
+                setOutput('✅ ' + result);
+            });
+        }
+        
+        function testLog() {
+            if (!bridge) return setOutput('❌ Мост не готов');
+            bridge.log_from_js('Тестовое сообщение в ' + new Date().toLocaleTimeString());
+            setOutput('✅ Сообщение отправлено в консоль Python');
+        }
+    </script>
+</body>
+</html>

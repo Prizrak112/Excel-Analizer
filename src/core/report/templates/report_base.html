@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ title }}</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+  <style>
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: {{ theme.bg }};
+      color: {{ theme.text }};
+      font-family: {{ theme.font }};
+      font-size: 14px;
+      min-height: 100vh;
+    }
+
+    .ea-report {
+      position: relative;
+      width: {{ page_width }}px;
+      min-height: 100vh;
+      margin: 0 auto;
+      background: {{ theme.bg }};
+    }
+
+    .ea-page-title {
+      padding: 24px 30px 10px;
+      font-size: 26px;
+      font-weight: 700;
+      color: {{ theme.text }};
+    }
+
+    .ea-canvas {
+      position: relative;
+      width: 100%;
+      min-height: 800px;
+    }
+
+    /* ── Блоки ── */
+
+    .ea-block {
+      position: absolute;
+      background: #FFFFFF;
+      border: 1px solid rgba(0,0,0,0.06);
+      border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      overflow: hidden;
+      padding: 10px;
+    }
+
+    .ea-chart-canvas {
+      width: 100%;
+      height: 100%;
+      min-height: 200px;
+    }
+
+    /* KPI */
+    .ea-kpi {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 20px 24px;
+    }
+    .ea-kpi-title {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+      color: #8B93A7;
+      margin-bottom: 6px;
+    }
+    .ea-kpi-value {
+      font-weight: 700;
+      line-height: 1.1;
+    }
+    .ea-kpi-subtitle {
+      font-size: 12px;
+      color: #8B93A7;
+      margin-top: 4px;
+    }
+
+    /* Таблица */
+    .ea-table { padding: 0; overflow: auto; }
+    .ea-table-el {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .ea-table-el th {
+      background: #F5F7FA;
+      color: #1A1A1A;
+      font-weight: 600;
+      text-align: left;
+      padding: 8px 12px;
+      border-bottom: 1px solid rgba(0,0,0,0.08);
+      position: sticky; top: 0;
+    }
+    .ea-table-el td {
+      padding: 6px 12px;
+      border-bottom: 1px solid rgba(0,0,0,0.04);
+    }
+    .ea-table-el.ea-striped tr:nth-child(even) td {
+      background: rgba(0,0,0,0.02);
+    }
+
+    /* Текст */
+    .ea-text { padding: 16px 20px; }
+    .ea-text-content h1 { font-size: 22px; margin: 8px 0 12px; }
+    .ea-text-content h2 { font-size: 17px; margin: 8px 0 10px; }
+    .ea-text-content p  { margin: 6px 0; }
+    .ea-text-content ul { margin: 6px 0 6px 20px; padding: 0; }
+    .ea-text-content li { margin: 2px 0; }
+
+    /* Заглушки */
+    .ea-empty, .ea-error {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #F5F7FA;
+      color: #8B93A7;
+      font-size: 12px;
+      text-align: center;
+      border: 1px dashed rgba(0,0,0,0.12);
+    }
+    .ea-error { color: #b91c1c; background: #fef2f2; border-color: #fecaca; }
+    .ea-error-msg { padding: 16px; font-family: monospace; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <div class="ea-report" id="ea-report">
+    <div class="ea-page-title">{{ title }}</div>
+    <div class="ea-canvas" id="ea-canvas">
+      {{ blocks|safe }}
+    </div>
+  </div>
+
+  <script>
+    // Пересчёт высоты canvas при resize
+    (function() {
+      function fixCanvasHeight() {
+        var canvas = document.getElementById('ea-canvas');
+        if (!canvas) return;
+        var blocks = canvas.querySelectorAll('.ea-block');
+        var maxBottom = 0;
+        for (var i = 0; i < blocks.length; i++) {
+          var b = blocks[i];
+          var top = parseInt(b.style.top) || 0;
+          var h = parseInt(b.style.height) || 0;
+          maxBottom = Math.max(maxBottom, top + h);
+        }
+        canvas.style.minHeight = Math.max(800, maxBottom + 40) + 'px';
+      }
+
+      // Plotly дорисовывается асинхронно, поэтому пересчитываем после
+      // небольшой задержки и при каждой загрузке
+      window.addEventListener('load', function() {
+        setTimeout(fixCanvasHeight, 100);
+        setTimeout(fixCanvasHeight, 500);
+      });
+      window.addEventListener('resize', fixCanvasHeight);
+    })();
+  </script>
+</body>
+</html>

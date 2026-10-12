@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Отчёт</title>
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <style>
+        /* ============================================================
+           Базовые сбросы и типографика
+           ============================================================ */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        html, body {
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: #f5f7f9;
+            color: #333;
+            line-height: 1.5;
+        }
+        
+        #report {
+            padding: 24px 32px 80px 32px;
+        }
+        
+        /* ============================================================
+           Заголовки разделов
+           ============================================================ */
+        h1.section-title {
+            color: #003F0B;
+            font-size: 1.7rem;
+            font-weight: 700;
+            margin-top: 15px;
+            margin-bottom: 15px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #87C800;
+        }
+        
+        h1.section-title:first-child {
+            margin-top: 0;
+        }
+        
+        .section-divider {
+            height: 2px;
+            background: linear-gradient(to right, #87C800, transparent);
+            margin: 40px 0 20px 0;
+            border-radius: 1px;
+        }
+        
+        /* ============================================================
+           Блоки
+           ============================================================ */
+        .block {
+            margin-bottom: 20px;
+        }
+        
+        .block-card {
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 20px 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        
+        .block-card.error {
+            border-left: 4px solid #e74c3c;
+            background: #fff5f5;
+        }
+        
+        .block-error-title {
+            color: #c0392b;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+        
+        .block-error-message {
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            color: #666;
+            background: #f8f8f8;
+            padding: 10px;
+            border-radius: 4px;
+            margin-top: 8px;
+        }
+        
+        /* ============================================================
+           Параграф
+           ============================================================ */
+        .paragraph {
+            font-size: 14px;
+            line-height: 1.65;
+            color: #2a3a30;
+        }
+        
+        .paragraph p {
+            margin-bottom: 12px;
+        }
+        
+        .paragraph p:last-child {
+            margin-bottom: 0;
+        }
+        
+        .paragraph b, .paragraph strong {
+            color: #003F0B;
+        }
+        
+        /* ============================================================
+           KPI-карточки
+           ============================================================ */
+        .kpi-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        
+        .kpi-card {
+            flex: 1 1 180px;
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 20px 22px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            text-align: center;
+        }
+        
+        .kpi-value {
+            font-size: 26px;
+            font-weight: 700;
+            color: #003F0B;
+            line-height: 1.2;
+        }
+        
+        .kpi-value.accent {
+            color: #87C800;
+        }
+        
+        .kpi-label {
+            font-size: 11px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 6px;
+        }
+        
+        /* ============================================================
+           Список
+           ============================================================ */
+        .block-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        
+        .block-list li {
+            padding: 8px 0;
+            font-size: 14px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        
+        .block-list li:last-child {
+            border-bottom: none;
+        }
+        
+        /* ============================================================
+           Таблица данных
+           ============================================================ */
+        .data-table-wrapper {
+            width: 100%;
+            overflow-x: auto;
+            border-radius: 12px;
+        }
+        
+        .data-table-wrapper::-webkit-scrollbar {
+            height: 10px;
+        }
+        
+        .data-table-wrapper::-webkit-scrollbar-track {
+            background: #f1f7f1;
+            border-radius: 6px;
+        }
+        
+        .data-table-wrapper::-webkit-scrollbar-thumb {
+            background: #87C800;
+            border-radius: 6px;
+        }
+        
+        .data-table-wrapper::-webkit-scrollbar-thumb:hover {
+            background: #6ea800;
+        }
+        
+        .data-table {
+            border-collapse: collapse;
+            font-size: 13px;
+            min-width: 100%;
+            white-space: nowrap;
+        }
+        
+        .data-table th {
+            background: #f1f7f1;
+            color: #003F0B;
+            font-weight: 700;
+            text-align: left;
+            padding: 10px 14px;
+            border-bottom: 2px solid #87C800;
+            white-space: nowrap;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+        
+        .data-table td {
+            padding: 8px 14px;
+            border-bottom: 1px solid #e5e7eb;
+            color: #333;
+        }
+        
+        .data-table tr:last-child td {
+            border-bottom: none;
+        }
+        
+        .data-table tr:hover td {
+            background: #f9fdf5;
+        }
+        
+        /* ============================================================
+           Панель разработчика (тестовая)
+           ============================================================ */
+        .dev-toolbar {
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 10px 14px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            z-index: 1000;
+        }
+        
+        .dev-toolbar button {
+            background: #87C800;
+            color: white;
+            border: none;
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+        }
+        
+        .dev-toolbar button:hover {
+            background: #6ea800;
+        }
+        
+        .dev-toolbar .status {
+            font-size: 12px;
+            color: #888;
+        }
+        
+        .dev-toolbar .status.ok {
+            color: #009128;
+        }
+    </style>
+</head>
+<body>
+    <!-- Сюда рендерится отчёт -->
+    <div id="report">
+        <p style="color:#888; text-align:center; padding:40px;">Загрузка отчёта...</p>
+    </div>
+    
+    <!-- Панель разработчика (пока тестовая) -->
+    <div class="dev-toolbar">
+        <span class="status" id="bridge-status">⏳ Подключение...</span>
+        <button onclick="reloadReport()">Перерендерить</button>
+    </div>
+    
+    <script>
+        var bridge = null;
+        
+        // Подключаемся к Python
+        new QWebChannel(qt.webChannelTransport, function(channel) {
+            bridge = channel.objects.bridge;
+            var statusEl = document.getElementById('bridge-status');
+            statusEl.textContent = '✅ Python подключён';
+            statusEl.className = 'status ok';
+            
+            // Загружаем отчёт сразу
+            reloadReport();
+        });
+        
+        // Перезагружает отчёт из Python
+        function reloadReport() {
+            console.log('[JS] reloadReport вызван, bridge=' + (bridge ? 'есть' : 'нет'));
+            if (!bridge) {
+                console.log('[JS] Мост не готов, выходим');
+                return;
+            }
+            bridge.get_report_html(function(html) {
+                console.log('[JS] Получен HTML, длина=' + html.length);
+                var report = document.getElementById('report');
+                console.log('[JS] #report найден: ' + (report ? 'да' : 'нет'));
+                report.innerHTML = html;
+                console.log('[JS] HTML вставлен');
+            });
+        }
+        
+        // Функция для обновления содержимого отчёта (вызывается из Python)
+        function showReportHtml(html) {
+            document.getElementById('report').innerHTML = html;
+        }
+    </script>
+</body>
+</html>
