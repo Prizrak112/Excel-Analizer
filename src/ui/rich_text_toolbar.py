@@ -43,6 +43,23 @@ from src.ui.rich_text_editor import (
 class RichTextToolbar(QWidget):
     """Общий тулбар форматирования. Управляет активным RichTextEditor."""
 
+    def _get_valid_editor(self):
+        """Возвращает редактор, если он жив в C++, иначе сбрасывает в None."""
+        if self._current_editor is None:
+            return None
+        try:
+            from shiboken6 import isValid
+            if not isValid(self._current_editor):
+                self._current_editor = None
+                return None
+        except Exception:
+            try:
+                _ = self._current_editor.metaObject()
+            except RuntimeError:
+                self._current_editor = None
+                return None
+        return self._current_editor
+
     def __init__(self, theme, parent=None):
         super().__init__(parent)
         self.theme = theme
@@ -338,69 +355,84 @@ class RichTextToolbar(QWidget):
 
     # ---------- Обработчики ----------
 
+    # ---------- Обработчики ----------
+
     def _on_bold(self):
-        if self._current_editor is not None:
-            self._current_editor.toggle_bold()
+        editor = self._get_valid_editor()
+        if editor is not None:
+            editor.toggle_bold()
 
     def _on_italic(self):
-        if self._current_editor is not None:
-            self._current_editor.toggle_italic()
+        editor = self._get_valid_editor()
+        if editor is not None:
+            editor.toggle_italic()
 
     def _on_underline(self):
-        if self._current_editor is not None:
-            self._current_editor.toggle_underline()
+        editor = self._get_valid_editor()
+        if editor is not None:
+            editor.toggle_underline()
 
     def _on_font_changed(self, family: str):
-        if self._current_editor is not None and family:
-            self._current_editor.apply_font_family(family)
+        editor = self._get_valid_editor()
+        if editor is not None and family:
+            editor.apply_font_family(family)
 
     def _on_size_changed(self, text: str):
-        if self._current_editor is None:
+        editor = self._get_valid_editor()
+        if editor is None:
             return
         try:
             size = float(text)
         except ValueError:
             return
-        self._current_editor.apply_font_size(int(size))
+        editor.apply_font_size(int(size))
 
     def _on_align(self, kind: str):
-        if self._current_editor is not None:
-            self._current_editor.set_align(kind)
+        editor = self._get_valid_editor()
+        if editor is not None:
+            editor.set_align(kind)
 
     def _on_list(self, ordered: bool):
-        if self._current_editor is not None:
-            self._current_editor.make_list(ordered)
+        editor = self._get_valid_editor()
+        if editor is not None:
+            editor.make_list(ordered)
 
     def _on_remove_list(self):
-        if self._current_editor is not None:
-            self._current_editor.remove_list()
+        editor = self._get_valid_editor()
+        if editor is not None:
+            editor.remove_list()
 
     def _on_color_text(self):
-        if self._current_editor is None:
+        editor = self._get_valid_editor()
+        if editor is None:
             return
-        color = self._current_editor.pick_color_text()
+        color = editor.pick_color_text()
         if color:
             self._last_text_color = color
-            self._current_editor.apply_color(color)
+            editor.apply_color(color)
             self._btn_color.setIcon(_make_color_icon("A", color))
 
     def _on_color_bg(self):
-        if self._current_editor is None:
+        editor = self._get_valid_editor()
+        if editor is None:
             return
-        color = self._current_editor.pick_color_bg()
+        color = editor.pick_color_bg()
         if color:
             self._last_bg_color = color
-            self._current_editor.apply_bg_color(color)
+            editor.apply_bg_color(color)
             self._btn_bg.setIcon(_make_color_icon("✎", color))
 
     def _on_clear(self):
-        if self._current_editor is not None:
-            self._current_editor.clear_format()
+        editor = self._get_valid_editor()
+        if editor is not None:
+            editor.clear_format()
 
     def _on_undo(self):
-        if self._current_editor is not None:
-            self._current_editor.undo()
+        editor = self._get_valid_editor()
+        if editor is not None:
+            editor.undo()
 
     def _on_redo(self):
-        if self._current_editor is not None:
-            self._current_editor.redo()
+        editor = self._get_valid_editor()
+        if editor is not None:
+            editor.redo()

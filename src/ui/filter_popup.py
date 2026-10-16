@@ -1,5 +1,5 @@
 """
-Всплывающее окно фильтра колонки — список уникальных значений с чекбоксами.
+Всплывающее окно фильтра колонки — список уникальных значений с чекбоксами и сортировкой.
 """
 
 from PySide6.QtWidgets import (
@@ -13,9 +13,10 @@ MAX_UNIQUE_VALUES = 5000
 
 
 class FilterPopup(QWidget):
-    """Попап фильтра колонки."""
+    """Попап фильтра колонки с управлением сортировкой."""
 
-    applied = Signal(str, list)   # column_name, allowed_values (пусто = снять фильтр)
+    applied = Signal(str, list)         # column_name, allowed_values (пусто = снять фильтр)
+    sort_requested = Signal(str, bool)  # column_name, ascending
 
     def __init__(self, theme, column_name, unique_values, current_filter, parent=None):
         super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
@@ -34,7 +35,7 @@ class FilterPopup(QWidget):
     # ============================================================
 
     def _build_ui(self):
-        self.setFixedSize(300, 420)
+        self.setFixedSize(300, 460)
         self.setStyleSheet(f"""
             QWidget {{
                 background: {self.theme.bg_card};
@@ -88,6 +89,20 @@ class FilterPopup(QWidget):
             f"color: {self.theme.primary}; font-size: 12px; font-weight: bold;"
         )
         layout.addWidget(title)
+
+        # Кнопки сортировки (перенесены из шапки)
+        sort_row = QHBoxLayout()
+        sort_row.setSpacing(6)
+
+        btn_sort_asc = QPushButton("▲ Сортировка А-Я")
+        btn_sort_asc.clicked.connect(lambda: self._on_sort(True))
+
+        btn_sort_desc = QPushButton("▼ Сортировка Я-А")
+        btn_sort_desc.clicked.connect(lambda: self._on_sort(False))
+
+        sort_row.addWidget(btn_sort_asc)
+        sort_row.addWidget(btn_sort_desc)
+        layout.addLayout(sort_row)
 
         # Поле поиска
         self.edit_search = QLineEdit()
@@ -159,6 +174,10 @@ class FilterPopup(QWidget):
     # Действия
     # ============================================================
 
+    def _on_sort(self, ascending: bool):
+        self.sort_requested.emit(self.column_name, ascending)
+        self.close()
+
     def _on_search(self, text: str):
         needle = text.lower()
         for i in range(self.list_widget.count()):
@@ -183,7 +202,6 @@ class FilterPopup(QWidget):
             if item.checkState() == Qt.Checked:
                 allowed.append(item.text())
 
-        # Если отмечено всё — считаем фильтр снятым
         if len(allowed) == len(self.unique_values):
             self.applied.emit(self.column_name, [])
         else:

@@ -10,6 +10,8 @@ from PySide6.QtCore import Qt
 from src.core.block_factory import BLOCK_TYPES, RenderContext, render_report
 from src.core.report_model import Report, ReportBlock
 from src.core.preview_server import PreviewServer
+from src.core.code_generator import generate_report_script, ReportCodeGenerator
+from src.core.bug_reporter import BugReporter
 import base64
 from src.core.assets_loader import tabulator_css, canvas_datagrid_js
 from src.ui.canvas import Canvas
@@ -20,6 +22,7 @@ from src.ui.code_editor import CodeEditorWidget
 from src.ui.toast import ToastManager
 from src.ui.rich_text_dialog import RichTextDialog, clean_qt_html
 from src.ui.rich_text_toolbar import RichTextToolbar
+
 
 class ConstructorTab(QWidget):
     """Вкладка «🎨 Конструктор» со своим меню."""
@@ -34,15 +37,10 @@ class ConstructorTab(QWidget):
         self._preview = PreviewServer()
 
         self._build_ui()
+        BugReporter.register_context_provider(self._collect_bug_context)
         self._refresh_all()
 
     def _on_block_delete(self, block_id: str):
-        """
-        Удалить блок по ПКМ.
-
-        ★ Если block_id начинается с «__section__» — это ЯРЛЫК на раздел
-        (Section), а не ReportBlock. Тогда удаляем сам раздел.
-        """
         if block_id.startswith("__section__"):
             section_id = block_id[len("__section__"):]
             self.report.remove_section(section_id)
@@ -60,7 +58,6 @@ class ConstructorTab(QWidget):
         _, parent_list, block = found
         parent_list.remove(block)
 
-        # Сбросить выделение, если удалили выбранный
         if self._sel_block == block_id:
             self._sel_block = None
             self.inspector.show_empty()
@@ -73,7 +70,6 @@ class ConstructorTab(QWidget):
     # ============================================================
 
     def _on_edit_text_requested(self, block_id: str):
-        """Открывает диалог rich-text для текстового блока."""
         found = self.report.find_block(block_id)
         if found is None:
             return
@@ -84,11 +80,9 @@ class ConstructorTab(QWidget):
 
         cfg = block.config or {}
 
-        # ── Какой HTML подставить в диалог ──
         if block.type == "section_title":
             html = cfg.get("title", "") or ""
             if not cfg.get("raw_html"):
-                # Простой текст → обернуть в <p>
                 html = f"<p>{_esc_html(html)}</p>" if html else ""
 
         elif block.type == "paragraph":
@@ -99,13 +93,11 @@ class ConstructorTab(QWidget):
         elif block.type == "list":
             html = cfg.get("html", "") or ""
             if not html:
-                # Legacy: собрать <ul> из items
                 items = cfg.get("items") or []
                 if items:
                     li = "".join(f"<li>{_esc_html(x)}</li>" for x in items)
                     html = f"<ul>{li}</ul>"
 
-        # ── Диалог ──
         dlg = RichTextDialog(
             self.theme,
             kind=block.type,
@@ -117,7 +109,6 @@ class ConstructorTab(QWidget):
 
         new_html = dlg.result_html
 
-        # ── Обновляем config ──
         new_cfg = dict(cfg)
         if block.type == "section_title":
             new_cfg["title"] = new_html
@@ -128,7 +119,6 @@ class ConstructorTab(QWidget):
         elif block.type == "list":
             new_cfg["html"] = new_html
             new_cfg["raw_html"] = True
-            # ★ Поддержка legacy: собираем items из <li>
             items = _html_to_items(new_html)
             new_cfg["items"] = items
 
@@ -143,8 +133,6 @@ class ConstructorTab(QWidget):
     # ============================================================
 
     def _on_editor_focus_in(self, block_id: str):
-        """Пользователь кликнул в текстовый блок — активируем тулбар."""
-        # ★ Отменяем отложенный сброс, если он был запланирован.
         if hasattr(self, "_focus_out_timer") and self._focus_out_timer.isActive():
             self._focus_out_timer.stop()
 
@@ -161,24 +149,9 @@ class ConstructorTab(QWidget):
             self.rich_toolbar.set_editor(rich_editor)
 
     def _on_editor_focus_out(self, block_id: str):
-        """
-        Фокус ушёл из редактора.
-
-        ★ Ничего не делаем. Тулбар остаётся активным и продолжает
-        управлять последним редактором, с которым работал пользователь.
-
-        Это сделано намеренно: сброс на focus_out конфликтует с combo
-        «Шрифт»/«Размер» — при клике на combo Qt показывает попап
-        (отдельный top-level виджет), фокус уходит из редактора,
-        и любой автоматический сброс тулбара ломает попап.
-
-        Переключение на другой редактор происходит по focus_in
-        следующего блока — тогда _on_editor_focus_in просто
-        устанавливает новый редактор.
-        """
         pass
+
     def _on_editor_content_changed(self, block_id: str, html: str):
-        """Текст в блоке изменился. Пишем в config БЕЗ перестройки холста."""
         found = self.report.find_block(block_id)
         if found is None:
             return
@@ -193,15 +166,13 @@ class ConstructorTab(QWidget):
         elif block.type == "list":
             cfg["html"] = cleaned
             cfg["raw_html"] = True
-            # Legacy-поле items (для code generator и старых отчётов)
             cfg["items"] = _html_to_items_from_html(cleaned)
         else:
             return
 
         block.config = cfg
 
-        # ★ НЕ вызываем _refresh_canvas() — иначе будет цикл.
-        # Только тихо обновляем preview.
+        self._refresh_report_code()
         self._push_preview_debounced()
 
     # ============================================================
@@ -229,7 +200,6 @@ class ConstructorTab(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Тонкая полоса сверху: только кнопка Предпросмотр ──
         root.addWidget(self._build_preview_bar())
 
         self._splitter = QSplitter(Qt.Horizontal)
@@ -249,16 +219,16 @@ class ConstructorTab(QWidget):
         self.canvas.section_clicked.connect(self._on_section_selected)
         self.canvas.block_moved.connect(self._on_block_moved)
         self.canvas.block_merge_requested.connect(self._on_block_merge_requested)
+        self.canvas.block_live_resized.connect(self._on_block_live_resized)
         self.canvas.block_resized.connect(self._on_block_resized)
+        self.canvas.block_position_changed.connect(self._on_block_position_changed)
         self.canvas.empty_clicked.connect(self._on_add_section)
 
         self.canvas.block_delete_requested.connect(self._on_block_delete)
         self.canvas.block_duplicate_requested.connect(self._on_block_duplicate)
         self.canvas.block_move_up_requested.connect(self._on_block_move_up)
         self.canvas.block_move_down_requested.connect(self._on_block_move_down)
-        # ★ Двойной клик / ПКМ «Редактировать текст» → диалог
         self.canvas.block_edit_text_requested.connect(self._on_edit_text_requested)
-        # ★ Инлайн-редактирование: фокус и изменения текста
         self.canvas.block_focus_in.connect(self._on_editor_focus_in)
         self.canvas.block_focus_out.connect(self._on_editor_focus_out)
         self.canvas.block_content_changed.connect(self._on_editor_content_changed)
@@ -266,9 +236,10 @@ class ConstructorTab(QWidget):
 
         self.inspector = BlockInspector(self.theme)
         self.inspector.config_changed.connect(self._on_config_changed)
+        self.inspector.unmerge_requested.connect(self._on_unmerge_requested)
         self._splitter.addWidget(self.inspector)
 
-        self._splitter.setSizes([180, 220, 720, 320])
+        self._splitter.setSizes([200, 210, 720, 330])
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 0)
         self._splitter.setStretchFactor(2, 1)
@@ -285,7 +256,6 @@ class ConstructorTab(QWidget):
         return w
 
     def _build_preview_bar(self) -> QWidget:
-        """Полоса сверху: тулбар форматирования + кнопка «Предпросмотр»."""
         bar = QWidget()
         bar.setFixedHeight(40)
         bar.setStyleSheet(
@@ -296,11 +266,17 @@ class ConstructorTab(QWidget):
         lay.setContentsMargins(12, 4, 12, 4)
         lay.setSpacing(8)
 
-        # ★ Общий тулбар форматирования (изначально неактивен)
         self.rich_toolbar = RichTextToolbar(self.theme, bar)
         lay.addWidget(self.rich_toolbar)
 
         lay.addStretch()
+
+        b_bug = QPushButton("🐞  Баг-репорт")
+        b_bug.setCursor(Qt.PointingHandCursor)
+        b_bug.setToolTip("Сохранить диагностический отчёт в папку bug_reports/")
+        b_bug.setStyleSheet(_btn_qss(self.theme, primary=False))
+        b_bug.clicked.connect(self._on_manual_bug_report)
+        lay.addWidget(b_bug)
 
         b_prev = QPushButton("👁  Предпросмотр")
         b_prev.setCursor(Qt.PointingHandCursor)
@@ -335,11 +311,50 @@ class ConstructorTab(QWidget):
                 "# Добавьте разделы и блоки в подвкладке «Дизайн»"
             )
             return
-        self.code_view.set_code(
-            "# Генератор Python-кода для отчёта появится на следующем шаге.\n"
-            f"# Сейчас в отчёте: {len(self.report.sections)} раздел(ов), "
-            f"{self.report.get_stats()['blocks']} блок(ов)."
+
+        file_name = "data.xlsx"
+        sheet_name = 0
+        if self.current_data is not None:
+            file_name = getattr(self.current_data, "filepath", None) or getattr(self.current_data, "file_path", "data.xlsx")
+            sheet_name = getattr(self.current_data, "sheet_name", 0) or 0
+
+        code = generate_report_script(
+            report_model=self.report,
+            file_name=str(file_name),
+            sheet_name=sheet_name,
         )
+        self.code_view.set_code(code)
+
+    def _collect_bug_context(self) -> dict:
+        df = getattr(self.current_data, "dataframe", None) if self.current_data else None
+        df_info = {"loaded": False}
+        if df is not None:
+            df_info = {
+                "loaded": True,
+                "rows": len(df),
+                "columns": {str(c): str(t) for c, t in df.dtypes.items()},
+            }
+        sections_dump = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "blocks": [ReportCodeGenerator._serialize_block(b) for b in s.blocks],
+            }
+            for s in getattr(self.report, "sections", [])
+        ]
+        return {
+            "dataframe_info": df_info,
+            "report_state": {"title": self.report.title, "sections": sections_dump},
+            "generated_code": self.code_view.toPlainText() if hasattr(self.code_view, "toPlainText") else "",
+        }
+
+    def _on_manual_bug_report(self):
+        path = BugReporter.capture_exception(
+            RuntimeError("Manual Bug Report Snapshot"),
+            where="ConstructorTab (кнопка Баг-репорт)",
+        )
+        if path:
+            ToastManager.info("Баг-репорт сохранён", str(path), self.theme)
 
     def _save_report_code(self):
         if not self.report.sections:
@@ -424,8 +439,6 @@ class ConstructorTab(QWidget):
                 df = None
 
         try:
-            # ★ Экспорт — без preview-лимита (preview_limit=0).
-            #   Но предупредим пользователя, если данных очень много.
             total = 0
             if df is not None:
                 try:
@@ -434,7 +447,6 @@ class ConstructorTab(QWidget):
                     total = 0
 
             if total > 50_000:
-                from PySide6.QtWidgets import QMessageBox
                 reply = QMessageBox.question(
                     self, "Большая таблица",
                     f"В таблице {total:,} строк.\n\n"
@@ -473,9 +485,7 @@ class ConstructorTab(QWidget):
                 df = None
         self.inspector.set_dataframe(df)
         self._refresh_canvas()
-        # ★ Обновляем preview, чтобы блоки, созданные ДО загрузки Excel,
-        #   увидели актуальный dataframe (иначе data_table остаётся
-        #   «нет выбранных колонок» до пересоздания блока).
+        self._refresh_report_code()
         try:
             self._push_preview()
         except Exception:
@@ -574,12 +584,33 @@ class ConstructorTab(QWidget):
         self._refresh_all()
         ToastManager.success(
             "Блоки объединены",
-            "Теперь они в контейнере.",
+            "Теперь они стоят рядом в контейнере.",
             self.theme,
         )
 
+    def _on_unmerge_requested(self, block_id: str):
+        if self.report.unmerge_container(block_id):
+            self._sel_block = None
+            self.inspector.show_empty()
+            self._refresh_all()
+            ToastManager.success("Контейнер разбит", "Блоки возвращены на холст", self.theme)
+
+    def _on_block_live_resized(self, block_id: str, width_pct: int, min_height_px: int):
+        """Мгновенно двигает ползунок и спинбокс в инспекторе, пока пользователь тянет за угол."""
+        found = self.report.find_block(block_id)
+        if found is not None:
+            _, block = found
+            cfg = dict(block.config or {})
+            cfg["width"] = width_pct
+            cfg["min_height"] = min_height_px
+            block.config = cfg
+            if self._sel_block != block_id:
+                self._sel_block = block_id
+                self.inspector.show_block(block)
+        self.inspector.sync_live_geometry(block_id, width_pct, min_height_px)
+
     def _on_block_resized(self, block_id: str, width_pct: int, min_height_px: int):
-        """Пользователь потянул за угол блока."""
+        """Фиксирует итоговый размер после отпускания мыши, обновляет код и предпросмотр."""
         found = self.report.find_block(block_id)
         if found is None:
             return
@@ -588,15 +619,28 @@ class ConstructorTab(QWidget):
         cfg["width"] = width_pct
         cfg["min_height"] = min_height_px
         block.config = cfg
-        # ★ НЕ перерисовываем — виджет уже изменён через setFixedWidth.
-        # Только обновляем preview.
+        self.inspector.sync_live_geometry(block_id, width_pct, min_height_px)
+        self._refresh_report_code()
+        self._push_preview()
+
+    def _on_block_position_changed(self, block_id: str, align: str, offset_x: int):
+        """Реакция на смену положения блока в пространстве страницы (лево / центр / право / сдвиг X)."""
+        found = self.report.find_block(block_id)
+        if found is None:
+            return
+        _, block = found
+        cfg = dict(block.config or {})
+        cfg["align"] = align
+        cfg["offset_x"] = offset_x
+        block.config = cfg
+        if self._sel_block == block_id:
+            self.inspector.show_block(block)
+        self._refresh_report_code()
         self._push_preview()
 
     # ---------- Контекстное меню ----------
 
     def _on_block_duplicate(self, block_id: str):
-        """ПКМ → Дублировать."""
-        # ★ Заголовок раздела (ярлык на Section) не дублируется
         if block_id.startswith("__section__"):
             return
         found = self.report.find_block_parent(block_id)
@@ -604,11 +648,9 @@ class ConstructorTab(QWidget):
             return
         _, parent_list, block = found
 
-        # Создаём копию с новым id и копией config
         import copy
         new_block = ReportBlock.create(block.type, copy.deepcopy(block.config or {}))
 
-        # Вставляем сразу после оригинала
         idx = parent_list.index(block)
         parent_list.insert(idx + 1, new_block)
 
@@ -618,8 +660,6 @@ class ConstructorTab(QWidget):
         ToastManager.info("Блок дублирован", "", self.theme)
 
     def _on_block_move_up(self, block_id: str):
-        """ПКМ → Вверх."""
-        # ★ Заголовок раздела (ярлык на Section) не двигается вверх
         if block_id.startswith("__section__"):
             return
         found = self.report.find_block_parent(block_id)
@@ -634,8 +674,6 @@ class ConstructorTab(QWidget):
         self._on_block_selected(block_id)
 
     def _on_block_move_down(self, block_id: str):
-        """ПКМ → Вниз."""
-        # ★ Заголовок раздела (ярлык на Section) не двигается вниз
         if block_id.startswith("__section__"):
             return
         found = self.report.find_block_parent(block_id)
@@ -658,8 +696,12 @@ class ConstructorTab(QWidget):
         self.canvas.select_block(None)
 
     def _on_config_changed(self, _block_id: str):
+        self.layers.rebuild(self.report)
+        if self._sel_block:
+            self.layers.select_block(self._sel_block)
         self._refresh_canvas()
-        self._push_preview()
+        self._refresh_report_code()
+        self._push_preview_debounced()
 
     def _on_preview(self):
         self._push_preview(open_browser=True)
@@ -672,9 +714,6 @@ class ConstructorTab(QWidget):
                     df = self.current_data.dataframe
                 except AttributeError:
                     df = None
-            # ★ Preview ограничен 1000 строк — иначе HTML с 20 000 строк
-            #   JSON весит ~20 МБ и грузится минуты. Полные данные — в
-            #   Excel; в HTML-отчёте они не нужны.
             ctx = RenderContext(dataframe=df, preview_limit=1000)
             body = render_report(self.report, ctx)
             html = _wrap_html(body, self.report.title or "Отчёт")
@@ -683,14 +722,14 @@ class ConstructorTab(QWidget):
             self._preview.show(html)
         except Exception as e:
             print(f"[Constructor] preview error: {e}")
+            BugReporter.capture_exception(e, where="ConstructorTab._push_preview")
 
     def _push_preview_debounced(self):
-        """Отложенный preview — не рендерим HTML на каждый keystroke."""
         if not hasattr(self, "_preview_timer"):
             from PySide6.QtCore import QTimer
             self._preview_timer = QTimer(self)
             self._preview_timer.setSingleShot(True)
-            self._preview_timer.setInterval(500)
+            self._preview_timer.setInterval(400)
             self._preview_timer.timeout.connect(self._push_preview)
         self._preview_timer.start()
 
@@ -701,10 +740,8 @@ class ConstructorTab(QWidget):
             self.layers.select_block(self._sel_block)
         try:
             self._refresh_report_code()
-        except Exception:
-            pass
-        # ★ Обновляем preview — иначе после «Создать раздел» /
-        #   «Удалить» / «Merge» в браузере остаётся старая версия.
+        except Exception as e:
+            print(f"[Constructor] code gen error: {e}")
         try:
             self._push_preview()
         except Exception:
@@ -787,7 +824,6 @@ def _btn_qss(theme, primary=False):
 
 
 def _html_to_items_from_html(html: str) -> list[str]:
-    """Достаёт пункты <li>...</li> из HTML в плоский список (legacy items)."""
     import re
     if not html:
         return []
@@ -806,7 +842,6 @@ def _html_to_items_from_html(html: str) -> list[str]:
 
 
 def _esc_html(text) -> str:
-    """Простое экранирование для вставки в HTML."""
     if not isinstance(text, str):
         text = str(text)
     return (
@@ -817,62 +852,76 @@ def _esc_html(text) -> str:
 
 
 def _html_to_items(html: str) -> list[str]:
-    """Достаёт пункты <li>…</li> из HTML в плоский список (для legacy-поля items)."""
-    import re
-    if not html:
-        return []
-    found = re.findall(r"<li[^>]*>(.*?)</li>", html, flags=re.IGNORECASE | re.DOTALL)
-    out = []
-    for raw in found:
-        text = re.sub(r"<[^>]+>", "", raw)
-        text = (text.replace("&nbsp;", " ")
-                    .replace("&amp;", "&")
-                    .replace("&lt;", "<")
-                    .replace("&gt;", ">")
-                    .strip())
-        if text:
-            out.append(text)
-    return out
+    return _html_to_items_from_html(html)
 
 
 def _default_config(block_type: str) -> dict:
     if block_type == "section_title":
-        return {"title": "Заголовок"}
+        return {"title": "Заголовок", "width": 100}
     if block_type == "paragraph":
-        return {"text": "Новый параграф. Отредактируйте его справа."}
+        return {"text": "Новый параграф. Отредактируйте его на холсте.", "width": 100, "align": "left", "offset_x": 0}
     if block_type == "list":
-        return {"items": ["Первый пункт", "Второй пункт", "Третий пункт"]}
+        return {"items": ["Первый пункт", "Второй пункт", "Третий пункт"], "width": 100, "align": "left", "offset_x": 0}
     if block_type == "divider":
         return {}
     if block_type == "kpi_row":
-        return {"cards": [
-            {"label": "Выручка", "value": "1 000 000", "accent": True},
-            {"label": "Клиентов", "value": "42", "accent": False},
-        ]}
+        return {
+            "cards": [
+                {"label": "Выручка", "value": "1 000 000", "accent": True},
+                {"label": "Клиентов", "value": "42", "accent": False},
+            ],
+            "width": 100,
+            "align": "left",
+            "offset_x": 0,
+        }
     if block_type == "data_table":
-        return {"max_rows": 20}
-    return {}
+        return {"max_rows": 20, "width": 100, "align": "left", "offset_x": 0}
+    if block_type == "plotly_chart":
+        return {
+            "title": "График данных",
+            "chart_type": "bar",
+            "x_col": "",
+            "y_col": "",
+            "agg": "sum",
+            "sort_by": "value_desc",
+            "top_n": 12,
+            "row_start": 0,
+            "row_limit": 0,
+            "palette": "corporate",
+            "bg_color": "#ffffff",
+            "legend_pos": "right",
+            "show_legend": True,
+            "show_values": True,
+            "show_grid": True,
+            "width": 100,
+            "min_height": 260,
+            "align": "left",
+            "offset_x": 0,
+        }
+    return {"width": 100, "align": "left", "offset_x": 0}
 
 
 def _wrap_html(body: str, title: str) -> str:
-    # ★ Вшиваем canvas-datagrid — быстрее Tabulator на больших данных.
     tab_css = tabulator_css()
     tab_js = canvas_datagrid_js()
-
-    # ★ JS содержит строки "</script>", "<div>" и т.п. — если вставить его
-    #   напрямую в <script>, HTML-парсер сломается, и код покажется как
-    #   текст. Обходим это, кодируя JS в base64 и подключая через
-    #   src="data:text/javascript;base64,..." — браузер декодирует
-    #   отдельно, HTML-парсер в содержимое не лезет.
     tab_js_b64 = base64.b64encode(tab_js.encode("utf-8")).decode("ascii")
 
     return f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="UTF-8"><title>{title}</title>
 <style>
-    /* ═══════════════ Tabulator (вшит) ═══════════════ */
     {tab_css}
-    /* ═══════════════ Стили отчёта ═══════════════ */
     *{{box-sizing:border-box}}
+    
+    /* Жестко ограничиваем SVG-графики Plotly размерами их контейнеров */
+    .js-plotly-plot, .plot-container, .user-select-none {{
+        width: 100% !important;
+        max-width: 100% !important;
+    }}
+    .main-svg {{
+        width: 100% !important;
+        height: auto !important;
+    }}
+
     body{{margin:0;padding:0;font-family:Arial,sans-serif;
          background:#f5f7f9;color:#222}}
 
@@ -883,18 +932,28 @@ def _wrap_html(body: str, title: str) -> str:
         flex-wrap:wrap;
         margin-bottom:0;
     }}
-    .container-row{{display:flex;flex-wrap:wrap;align-items:flex-start;gap:14px;}}
-    .container-row > .layout-item{{
-        flex: 1 1 0 !important;
-        max-width: none !important;
-        width: auto !important;
-        min-width: 0 !important;
+    .container-row{{
+        display: flex;
+        flex-wrap: wrap; /* Автоматический перенос графиков на новую строку, если не помещаются */
+        align-items: stretch;
+        gap: 16px;
+        width: 100%;
+        box-sizing: border-box;
+        background: #f8fafc;
+        border: 2px dashed #94a3b8;
+        border-radius: 10px;
+        padding: 14px;
     }}
-    .container-column{{display:flex;flex-direction:column;gap:14px;}}
-    .container-column > .layout-item{{
-        flex: 1 1 auto !important;
-        max-width: none !important;
-        width: auto !important;
+    .container-column{{
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        width: 100%;
+        box-sizing: border-box;
+        background: #f8fafc;
+        border: 2px dashed #94a3b8;
+        border-radius: 10px;
+        padding: 14px;
     }}
 
     h1.section-title{{
@@ -904,41 +963,10 @@ def _wrap_html(body: str, title: str) -> str:
         margin:25px 0 10px 0;
         padding-bottom:8px;
         border-bottom:2px solid #87C800;
+        scroll-margin-top: 25px;
     }}
-    .block{{margin-bottom:0; display:block; min-width:0;}}
-    .block-card{{background:#fff;border:1px solid #e0e0e5;border-radius:10px;padding:20px;min-width:0;}}
-
-    /* ★ Контейнер Tabulator — растягиваем на всю ширину карточки */
-    .ea-table-host{{padding: 0; width: 100%; min-width: 0;}}
-    .ea-table-host .tabulator{{
-        border: none !important;
-        background: transparent !important;
-        font-size: 13px !important;
-    }}
-    .ea-table-host .tabulator .tabulator-header{{
-        background: #f8f8fb !important;
-        border-bottom: 1px solid #e0e0e5 !important;
-        color: #555 !important;
-    }}
-    .ea-table-host .tabulator .tabulator-header .tabulator-col{{
-        background: transparent !important;
-        border-right: 1px solid #eee !important;
-    }}
-    .ea-table-host .tabulator .tabulator-col-title{{
-        font-weight: 600 !important;
-        font-size: 13px !important;
-    }}
-    .ea-table-host .tabulator .tabulator-row{{
-        border-bottom: 1px solid #eee !important;
-        min-height: 30px !important;
-    }}
-    .ea-table-host .tabulator .tabulator-row:hover{{
-        background: #f6fbf3 !important;
-    }}
-    .ea-table-host .tabulator .tabulator-cell{{
-        border-right: 1px solid #f0f0f0 !important;
-        padding: 6px 10px !important;
-    }}
+    .block{{margin-bottom:0; display:block; min-width:0; width:100%;}}
+    .block-card{{background:#fff;border:1px solid #e0e0e5;border-radius:10px;padding:20px;min-width:0;width:100%;}}
 
     .kpi-row{{display:flex;gap:16px;flex-wrap:wrap}}
     .kpi-card{{flex:1 1 120px;background:#fff;border:1px solid #e0e0e5;
@@ -1020,15 +1048,21 @@ def _wrap_html(body: str, title: str) -> str:
 <script>
 (function() {{
     var items = document.querySelectorAll('.toc-item');
+    var isScrolling = false;
+    var scrollTimeout = null;
+
     items.forEach(function(item) {{
         item.addEventListener('click', function(e) {{
             e.preventDefault();
             var targetId = this.getAttribute('data-target');
             var target = document.getElementById(targetId);
             if (target) {{
-                target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                isScrolling = true;
                 items.forEach(function(i) {{ i.classList.remove('active'); }});
                 this.classList.add('active');
+                target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                clearTimeout(scrollTimeout);
+                scrollTimeout = setTimeout(function() {{ isScrolling = false; }}, 800);
             }}
         }});
     }});
@@ -1040,17 +1074,16 @@ def _wrap_html(body: str, title: str) -> str:
         if (el) sections.push({{ el: el, item: item }});
     }});
 
-    function updateActive() {{
-        var scrollY = window.scrollY + 100;
-        var current = null;
+    window.addEventListener('scroll', function() {{
+        if (isScrolling) return;
+        var scrollY = window.pageYOffset + 100;
+        var current = sections[0];
         sections.forEach(function(s) {{
-            if (s.el.offsetTop <= scrollY) current = s;
+            if (s.el.offsetTop <= scrollY) {{ current = s; }}
         }});
         items.forEach(function(i) {{ i.classList.remove('active'); }});
-        if (current) current.item.classList.add('active');
-    }}
-    window.addEventListener('scroll', updateActive);
-    updateActive();
+        if (current) {{ current.item.classList.add('active'); }}
+    }});
 }})();
 </script>
 </body></html>"""

@@ -4,6 +4,7 @@
 """
 
 import re
+import pandas as pd
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,14 +19,19 @@ class SplitRule:
     Одно правило разделения.
     
     type:
-      - "before_word":  разделить перед словом X
-      - "after_word":   разделить после слова X
-      - "before_char":  разделить перед символом X
-      - "after_char":   разделить после символа X
-      - "position":     разделить на позиции N (fallback)
+      - "before_word":           разделить перед словом/фразой X
+      - "after_word":            разделить после слова/фразы X
+      - "before_char":           разделить перед символом X
+      - "after_char":            разделить после символа X
+      - "position":              разделить на позиции N от начала
+      - "position_from_end":     разделить за N символов до конца
+      - "word_count":            разделить после N-го слова
+      - "word_count_from_end":   разделить за N слов до конца
+      - "char_class_transition": разделить на границе смены типа символов
+      - "regex_boundary":        разделить по контекстному regex-шаблону
     
-    value: что искать (слово/символ) или номер позиции
-    occurrence: какое вхождение (1, 2, 3...) — если метка повторяется
+    value: что искать (слово/символ/шаблон) или номер позиции
+    occurrence: какое вхождение (1, 2, 3... или -1 для последнего)
     """
     type: str
     value: Any
@@ -36,7 +42,7 @@ class SplitRule:
     
     def describe(self) -> str:
         """Человеческое описание правила."""
-        occ = f" ({self.occurrence}-е вхождение)" if self.occurrence > 1 else ""
+        occ = " (последнее вхождение)" if self.occurrence == -1 else (f" ({self.occurrence}-е вхождение)" if self.occurrence > 1 else "")
         
         if self.type == "before_word":
             return f"Разделить перед словом «{self.value}»{occ}"
@@ -48,6 +54,16 @@ class SplitRule:
             return f"Разделить после «{self.value}»{occ}"
         elif self.type == "position":
             return f"Разделить на позиции {self.value}"
+        elif self.type == "position_from_end":
+            return f"Разделить за {self.value} симв. с конца"
+        elif self.type == "word_count":
+            return f"После {self.value}-го слова"
+        elif self.type == "word_count_from_end":
+            return f"За {self.value} сл. с конца"
+        elif self.type == "regex_boundary":
+            return f"По шаблону контекста «{self.value}»"
+        elif self.type == "char_class_transition":
+            return f"На границе смены типа символов ({self.value}){occ}"
         return f"Правило: {self.type} {self.value}"
 
 
@@ -57,6 +73,53 @@ class SplitRule:
 
 class RuleDetector:
     """Определяет правила разделения по примеру."""
+
+    @classmethod
+    def get_diverse_examples(cls, series, max_count: int = 7) -> list[str]:
+        """
+        Выбирает максимально разнообразные по структуре и длине примеры из колонки
+        (кластеризация по структурной сигнатуре: знаки препинания, количество слов, цифры).
+        """
+        raw_values = [str(v).strip() for v in series if pd.notna(v) and str(v).strip()]
+        if not raw_values:
+            return []
+        
+        unique_values = list(dict.fromkeys(raw_values))
+        if len(unique_values) <= max_count:
+            return unique_values
+
+        def _structural_signature(s: str) -> tuple:
+            punct = "".join(sorted(set(c for c in s if not c.isalnum() and not c.isspace())))
+            words_bucket = min(len(s.split()), 6)
+            has_digits = any(c.isdigit() for c in s)
+            return (punct, words_bucket, has_digits)
+
+        clusters: dict[tuple, list[str]] = {}
+        for val in unique_values:
+            sig = _structural_signature(val)
+            clusters.setdefault(sig, []).append(val)
+
+        sorted_clusters = sorted(clusters.values(), key=len, reverse=True)
+        
+        examples = []
+        for group in sorted_clusters:
+            if len(examples) >= max_count:
+                break
+            group_sorted = sorted(group, key=len)
+            median_val = group_sorted[len(group_sorted) // 2]
+            if median_val not in examples:
+                examples.append(median_val)
+
+        if len(examples) < max_count:
+            by_len = sorted(unique_values, key=len)
+            step = max(1, len(by_len) // (max_count - len(examples) + 1))
+            for i in range(0, len(by_len), step):
+                if len(examples) >= max_count:
+                    break
+                if by_len[i] not in examples:
+                    examples.append(by_len[i])
+
+        return examples[:max_count]
     
     @classmethod
     def detect_rules(
@@ -80,7 +143,6 @@ class RuleDetector:
         
         candidates: list[SplitRule] = []
         
-        # Пробуем все возможные правила
         candidates.extend(
             cls._try_word_rules(sample_value, marker_position)
         )
@@ -91,17 +153,13 @@ class RuleDetector:
             cls._try_position_rule(marker_position)
         )
         
-        # Убираем дубликаты
         candidates = cls._deduplicate(candidates)
         
-        # Оцениваем каждое
         for rule in candidates:
             cls._evaluate(rule, series)
         
-        # Сортируем по точности
         candidates.sort(key=lambda r: (-r.accuracy, r.occurrence))
         
-        # Возвращаем топ-N
         top = candidates[:max_rules]
         
         print(f"[RuleDetector] Найдено {len(candidates)} правил, топ-{len(top)}:")
@@ -123,7 +181,6 @@ class RuleDetector:
         """Правила по словам."""
         rules = []
         
-        # Слово слева — разделить ПОСЛЕ него
         left_word = cls._word_ending_at(sample, position)
         if left_word and cls._is_good_word(left_word):
             rules.append(SplitRule(
@@ -132,7 +189,6 @@ class RuleDetector:
                 occurrence=cls._count_occurrences_before(sample, left_word, position),
             ))
         
-        # Слово справа — разделить ПЕРЕД ним
         right_word = cls._word_starting_at(sample, position)
         if right_word and cls._is_good_word(right_word):
             rules.append(SplitRule(
@@ -152,11 +208,9 @@ class RuleDetector:
         if not word or len(word) < 3:
             return False
         
-        # Слово только из цифр — плохо (00, 01, 2026 и т.п.)
         if word.isdigit():
             return False
         
-        # Слово только из знаков препинания — плохо
         if not any(c.isalnum() for c in word):
             return False
         
@@ -171,42 +225,35 @@ class RuleDetector:
         """Правила по символам."""
         rules = []
         
-        # === СПЕЦИАЛЬНЫЙ СЛУЧАЙ: маяк между пробелами ===
-        # Если слева и справа от маяка пробелы — разделить по пробелу
         if 0 < position < len(sample):
             left_char = sample[position - 1]
             right_char = sample[position] if position < len(sample) else ""
             
-            # Маяк внутри пробелов — правило "по пробелу"
             if left_char == " " and right_char != " ":
-                # Маяк после пробела, перед началом слова
                 rules.append(SplitRule(
                     type="before_char",
                     value=" ",
                     occurrence=cls._count_occurrences_before(sample, " ", position),
                 ))
             elif left_char != " " and right_char == " ":
-                # Маяк перед пробелом, после конца слова
                 rules.append(SplitRule(
                     type="before_char",
                     value=" ",
                     occurrence=cls._count_occurrences_before(sample, " ", position) + 1,
                 ))
         
-        # Символ слева — разделить ПОСЛЕ него
         if 0 < position <= len(sample):
             lc = sample[position - 1:position]
-            if lc.strip() and not lc.isdigit():  # не пробел и не цифра
+            if lc.strip() and not lc.isdigit():
                 rules.append(SplitRule(
                     type="after_char",
                     value=lc,
                     occurrence=cls._count_occurrences_before(sample, lc, position),
                 ))
         
-        # Символ справа — разделить ПЕРЕД ним
         if position < len(sample):
             rc = sample[position:position + 1]
-            if rc.strip() and not rc.isdigit():  # не пробел и не цифра
+            if rc.strip() and not rc.isdigit():
                 rules.append(SplitRule(
                     type="before_char",
                     value=rc,
@@ -214,7 +261,7 @@ class RuleDetector:
                 ))
         
         return rules
-    
+
     @classmethod
     def _try_position_rule(cls, position: int) -> SplitRule:
         """Правило по позиции."""
@@ -234,14 +281,12 @@ class RuleDetector:
         if position <= 0:
             return ""
         
-        # Идём влево, пока не пробел/спецсимвол
         end = position
         start = position
         while start > 0 and sample[start - 1:start] not in " \t\n\r,;:!?()[]{}<>«»\"'":
             start -= 1
         
         word = sample[start:end].strip()
-        # Слово должно быть > 1 символа (не одиночный символ)
         return word if len(word) > 1 else ""
     
     @staticmethod
@@ -314,11 +359,9 @@ class RuleDetector:
         if pos is None:
             return False
         
-        # Позиция должна быть > 0 и < len (не пустая часть)
         if pos <= 0 or pos >= len(value):
             return False
         
-        # Проверяем, что обе части не пустые
         left = value[:pos].strip()
         right = value[pos:].strip()
         
@@ -347,14 +390,55 @@ class RuleDetector:
             return pos + len(rule.value)
         
         elif rule.type == "position":
-            return int(rule.value)
+            pos = int(rule.value)
+            return pos if 0 < pos < len(value) else None
+        
+        elif rule.type == "position_from_end":
+            pos = len(value) - int(rule.value)
+            return pos if 0 < pos < len(value) else None
+        
+        elif rule.type == "word_count":
+            matches = list(re.finditer(r'\S+', value))
+            n = int(rule.value)
+            if 0 < n < len(matches):
+                return matches[n - 1].end()
+            return None
+        
+        elif rule.type == "word_count_from_end":
+            matches = list(re.finditer(r'\S+', value))
+            n = int(rule.value)
+            if 0 < n < len(matches):
+                return matches[len(matches) - n].start()
+            return None
+        
+        elif rule.type == "regex_boundary":
+            m = re.search(str(rule.value), value)
+            if m:
+                return m.start(1) if m.lastindex and m.lastindex >= 1 else m.start()
+            return None
+        
+        elif rule.type == "char_class_transition":
+            pattern = str(rule.value)
+            matches = list(re.finditer(pattern, value))
+            if not matches:
+                return None
+            if rule.occurrence == -1:
+                return matches[-1].start(1)
+            elif 1 <= rule.occurrence <= len(matches):
+                return matches[rule.occurrence - 1].start(1)
+            return None
         
         return None
     
     @staticmethod
     def _find_nth(value: str, sub: str, n: int) -> int | None:
-        """Находит позицию N-го вхождения sub."""
-        if not sub or n < 1:
+        """Находит позицию N-го вхождения sub (или последнего при n == -1)."""
+        if not sub:
+            return None
+        if n == -1:
+            pos = value.rfind(sub)
+            return pos if pos >= 0 else None
+        if n < 1:
             return None
         
         pos = -1
@@ -363,6 +447,192 @@ class RuleDetector:
             if pos < 0:
                 return None
         return pos
+
+    @classmethod
+    def _infer_cut_positions(cls, full_str: str, target_str: str) -> list[tuple[int, str]]:
+        """
+        Определяет точные индексы разреза в исходной строке, которые дают target_str
+        (в качестве левой или правой части с учетом пробелов и знаков-разделителей).
+        """
+        full_s = full_str
+        target_s = target_str.strip()
+        if not full_s or not target_s or full_s.strip() == target_s:
+            return []
+        
+        results = []
+        for pos in range(1, len(full_s)):
+            left_raw = full_s[:pos].strip()
+            right_raw = full_s[pos:].strip()
+            
+            left_clean = left_raw.rstrip(",;:|/- ")
+            right_clean = right_raw.lstrip(",;:|/- ")
+            
+            if left_raw == target_s or left_clean == target_s:
+                results.append((pos, "left"))
+            if right_raw == target_s or right_clean == target_s:
+                results.append((pos, "right"))
+                
+        return results
+
+    @classmethod
+    def _generate_flash_fill_candidates(cls, sample: str, pos: int) -> list[SplitRule]:
+        """Генерирует все возможные гипотезы правил для разреза в точке pos."""
+        candidates: list[SplitRule] = []
+        
+        for offset in (0, -1, 1, -2, 2):
+            p = pos + offset
+            if 0 < p < len(sample):
+                candidates.extend(cls._try_word_rules(sample, p))
+                candidates.extend(cls._try_char_rules(sample, p))
+                
+                lc = sample[p - 1:p]
+                if lc.strip() and not lc.isdigit() and sample.rfind(lc) == p - 1:
+                    candidates.append(SplitRule(type="after_char", value=lc, occurrence=-1))
+                rc = sample[p:p + 1]
+                if rc.strip() and not rc.isdigit() and sample.rfind(rc) == p:
+                    candidates.append(SplitRule(type="before_char", value=rc, occurrence=-1))
+
+        for sep in (", ", "; ", " - ", " | ", " / ", " №", " Гос.", " гос.", " ("):
+            idx = sample.find(sep)
+            while idx != -1:
+                if abs(idx - pos) <= 2:
+                    occ = sample[:idx].count(sep) + 1
+                    candidates.append(SplitRule(type="before_word", value=sep, occurrence=occ))
+                    if sample.rfind(sep) == idx:
+                        candidates.append(SplitRule(type="before_word", value=sep, occurrence=-1))
+                if abs((idx + len(sep)) - pos) <= 2:
+                    occ = sample[:idx].count(sep) + 1
+                    candidates.append(SplitRule(type="after_word", value=sep, occurrence=occ))
+                    if sample.rfind(sep) == idx:
+                        candidates.append(SplitRule(type="after_word", value=sep, occurrence=-1))
+                idx = sample.find(sep, idx + 1)
+
+        left_words = len(re.findall(r'\S+', sample[:pos]))
+        right_words = len(re.findall(r'\S+', sample[pos:]))
+        if left_words > 0 and right_words > 0:
+            candidates.append(SplitRule(type="word_count", value=left_words, occurrence=1))
+            candidates.append(SplitRule(type="word_count_from_end", value=right_words, occurrence=1))
+
+        transitions = [
+            r'(?<=[А-Яа-яЁёA-Za-z])\s*(\d)',
+            r'(?<=\d)\s*([А-Яа-яЁёA-Za-z])',
+            r'(?<=[а-яёa-z])\s*([А-ЯЁA-Z])',
+        ]
+        for pat in transitions:
+            matches = list(re.finditer(pat, sample))
+            for idx_m, m in enumerate(matches):
+                if abs(m.start(1) - pos) <= 1:
+                    candidates.append(SplitRule(type="char_class_transition", value=pat, occurrence=idx_m + 1))
+                    if idx_m == len(matches) - 1:
+                        candidates.append(SplitRule(type="char_class_transition", value=pat, occurrence=-1))
+
+        candidates.append(SplitRule(type="position", value=pos, occurrence=1))
+        if len(sample) - pos > 0:
+            candidates.append(SplitRule(type="position_from_end", value=len(sample) - pos, occurrence=1))
+
+        return cls._deduplicate(candidates)
+
+    @classmethod
+    def _matches_user_pair(cls, rule: SplitRule, full_str: str, target_str: str) -> bool:
+        """Проверяет, дает ли правило точную целевую подстроку пользователя на примере."""
+        pos = cls._find_split_position(rule, full_str)
+        if pos is None or pos <= 0 or pos >= len(full_str):
+            return False
+        
+        target_clean = target_str.strip().strip(",;:|/- ")
+        left_clean = full_str[:pos].strip().rstrip(",;:|/- ")
+        right_clean = full_str[pos:].strip().lstrip(",;:|/- ")
+        
+        return (
+            full_str[:pos].strip() == target_str.strip()
+            or full_str[pos:].strip() == target_str.strip()
+            or left_clean == target_clean
+            or right_clean == target_clean
+        )
+
+    @staticmethod
+    def _rule_specificity_bonus(rule: SplitRule) -> float:
+        """Бонус за обобщающую способность типа правила."""
+        bonuses = {
+            "before_word": 0.08,
+            "after_word": 0.08,
+            "before_char": 0.06,
+            "after_char": 0.06,
+            "char_class_transition": 0.05,
+            "word_count": 0.03,
+            "word_count_from_end": 0.03,
+            "position_from_end": 0.01,
+            "position": 0.0,
+        }
+        return bonuses.get(rule.type, 0.0)
+
+    @classmethod
+    def detect_from_examples(
+        cls,
+        examples_pairs: list[tuple[str, str]],
+        series,
+    ) -> SplitRule | None:
+        """
+        Интеллектуальный синтез правила (Flash Fill) по набору отредактированных примеров
+        [(исходная_строка, желаемый_результат), ...].
+        """
+        valid_pairs = [
+            (full.strip(), part.strip())
+            for full, part in examples_pairs
+            if full and part and full.strip() != part.strip()
+        ]
+        if not valid_pairs:
+            return None
+
+        all_candidates: list[SplitRule] = []
+        for full_str, target_str in valid_pairs:
+            cut_points = cls._infer_cut_positions(full_str, target_str)
+            if not cut_points:
+                idx = full_str.find(target_str)
+                if idx == 0:
+                    cut_points.append((len(target_str), "left"))
+                elif idx > 0:
+                    cut_points.append((idx, "right"))
+            
+            for pos, _ in cut_points:
+                all_candidates.extend(cls._generate_flash_fill_candidates(full_str, pos))
+
+        all_candidates = cls._deduplicate(all_candidates)
+        if not all_candidates:
+            return None
+
+        best_rule = None
+        best_score = -1.0
+
+        for rule in all_candidates:
+            cls._evaluate(rule, series)
+            
+            user_matches = sum(
+                1 for full_s, part_s in valid_pairs
+                if cls._matches_user_pair(rule, full_s, part_s)
+            )
+            user_ratio = user_matches / len(valid_pairs)
+            
+            score = (user_ratio * 0.70) + (rule.accuracy * 0.30) + cls._rule_specificity_bonus(rule)
+            if score > best_score:
+                best_score = score
+                best_rule = rule
+
+        return best_rule
+
+    @classmethod
+    def detect_from_example(
+        cls,
+        sample_full: str,
+        sample_part: str,
+        series,
+    ) -> SplitRule | None:
+        """
+        Определяет правило разделения на основе одного примера.
+        """
+        if not sample_full or not sample_part:
+            return None
+        return cls.detect_from_examples([(sample_full, sample_part)], series)
 
 
 # ============================================================
@@ -387,7 +657,9 @@ def apply_rule(rule: SplitRule, value) -> tuple[str, str]:
     if pos is None or pos <= 0 or pos >= len(s):
         return s.strip(), ""
     
-    return s[:pos].strip(), s[pos:].strip()
+    p1 = s[:pos].strip().rstrip(",;:|")
+    p2 = s[pos:].strip().lstrip(",;:|")
+    return p1.strip(), p2.strip()
 
 
 def apply_rules_to_row(rules: list[SplitRule], value) -> list[str]:
@@ -402,28 +674,24 @@ def apply_rules_to_row(rules: list[SplitRule], value) -> list[str]:
     
     s = str(value)
     
-    # Находим все позиции разделения
     positions = []
     for rule in rules:
         pos = RuleDetector._find_split_position(rule, s)
         if pos is not None and 0 < pos < len(s):
             positions.append(pos)
     
-    # Сортируем и убираем дубликаты
     positions = sorted(set(positions))
     
     if not positions:
         return [s.strip()] + [""] * len(rules)
     
-    # Разбиваем строку
     parts = []
     prev = 0
     for pos in positions:
-        parts.append(s[prev:pos].strip())
+        parts.append(s[prev:pos].strip().strip(",;:|").strip())
         prev = pos
-    parts.append(s[prev:].strip())
+    parts.append(s[prev:].strip().strip(",;:|").strip())
     
-    # Дополняем до len(rules) + 1
     while len(parts) < len(rules) + 1:
         parts.append("")
     

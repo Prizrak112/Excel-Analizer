@@ -1,8 +1,3 @@
-"""
-Стартовая страница приложения.
-Две большие карточки-кнопки: Редактор / Конструктор.
-"""
-
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
 )
@@ -21,13 +16,13 @@ class StartCard(QFrame):
 
         self.setObjectName("start_card")
         self.setCursor(QCursor(Qt.PointingHandCursor))
-        self.setMinimumSize(300, 280)
+        self.setMinimumSize(320, 280)
         self.setMaximumWidth(380)
 
         self._apply_style(False)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 32, 28, 32)
+        layout.setContentsMargins(32, 40, 32, 40)
         layout.setSpacing(0)
 
         layout.addStretch()
@@ -39,27 +34,27 @@ class StartCard(QFrame):
         )
         layout.addWidget(icon_lbl)
 
-        layout.addSpacing(20)
+        layout.addSpacing(24)
 
         title_lbl = QLabel(title)
         title_lbl.setAlignment(Qt.AlignCenter)
         title_lbl.setStyleSheet(f"""
             color: {theme.text_main};
-            font-size: 19px;
+            font-size: 20px;
             font-weight: 700;
             background: transparent;
             border: none;
         """)
         layout.addWidget(title_lbl)
 
-        layout.addSpacing(10)
+        layout.addSpacing(12)
 
         sub_lbl = QLabel(subtitle)
         sub_lbl.setAlignment(Qt.AlignCenter)
         sub_lbl.setWordWrap(True)
         sub_lbl.setStyleSheet(f"""
             color: {theme.text_muted};
-            font-size: 13px;
+            font-size: 14px;
             line-height: 1.6;
             background: transparent;
             border: none;
@@ -81,7 +76,7 @@ class StartCard(QFrame):
             #start_card {{
                 background: {bg};
                 border: 1px solid {border};
-                border-radius: 14px;
+                border-radius: 16px;
             }}
         """)
 
@@ -112,7 +107,8 @@ class StartPage(QWidget):
 
     def _build_ui(self):
         t = self.theme
-        self.setStyleSheet(f"background: {t.bg_card};")
+        # Используем цвет фона приложения, чтобы карточки выделялись объёмом
+        self.setStyleSheet(f"background: {t.bg_page};")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(60, 60, 60, 60)
@@ -120,46 +116,67 @@ class StartPage(QWidget):
 
         root.addStretch(1)
 
-        # ── Приветствие ──
-        hello = QLabel("Добро пожаловать")
-        hello.setAlignment(Qt.AlignCenter)
-        hello.setStyleSheet(f"""
-            color: {t.text_main};
-            font-size: 32px;
-            font-weight: 700;
-            background: transparent;
+        # ── Логотип и Название ──
+        logo_container = QWidget()
+        logo_container.setStyleSheet("background: transparent; border: none;")
+        logo_lay = QHBoxLayout(logo_container)
+        logo_lay.setContentsMargins(0, 0, 0, 0)
+        logo_lay.setSpacing(12)
+        logo_lay.setAlignment(Qt.AlignCenter)
+
+        icon_label = QLabel("⬡")
+        icon_label.setStyleSheet(f"""
+            color: {t.primary};
+            font-size: 56px;
+            font-weight: normal;
+            margin-bottom: 8px; /* Визуальная компенсация центрирования */
         """)
-        root.addWidget(hello)
+        icon_label.setAlignment(Qt.AlignVCenter)
 
-        root.addSpacing(10)
+        text_label = QLabel("<b>NEX</b>GRID")
+        text_label.setStyleSheet(f"""
+            color: {t.text_main};
+            font-family: "Century Gothic", "Tw Cen MT", "Segoe UI", sans-serif;
+            font-size: 38px;
+            letter-spacing: 6px;
+        """)
+        text_label.setAlignment(Qt.AlignVCenter)
 
+        logo_lay.addWidget(icon_label)
+        logo_lay.addWidget(text_label)
+
+        root.addWidget(logo_container)
+
+        root.addSpacing(16)
+
+        # ── Подзаголовок ──
         sub = QLabel(
-            "Excel Analyzer — конструктор HTML-отчётов с редактором Excel-файлов.\n"
+            "Современный инструмент для анализа данных и публикации HTML-дашбордов.\n"
             "Выберите, с чего начать:"
         )
         sub.setAlignment(Qt.AlignCenter)
         sub.setStyleSheet(f"""
             color: {t.text_muted};
-            font-size: 13px;
+            font-size: 15px;
             line-height: 1.6;
             background: transparent;
         """)
         root.addWidget(sub)
 
-        root.addSpacing(50)
+        root.addSpacing(60)
 
         # ── Карточки ──
         cards_row = QHBoxLayout()
-        cards_row.setSpacing(28)
+        cards_row.setSpacing(32)
         cards_row.setAlignment(Qt.AlignCenter)
 
         card_editor = StartCard(
             t,
             "📊",
-            "Редактор",
-            "Загрузка XLSX, чистка данных,\n"
-            "преобразования, фильтры, сортировка\n"
-            "и просмотр Python-кода обработки",
+            "Данные",
+            "Загрузка XLSX, чистка таблиц,\n"
+            "преобразования, сводные, фильтры\n"
+            "и генерация Python-скрипта",
         )
         card_editor.clicked.connect(lambda: self.navigate_to.emit("editor"))
         cards_row.addWidget(card_editor)
@@ -167,10 +184,10 @@ class StartPage(QWidget):
         card_html = StartCard(
             t,
             "🎨",
-            "Конструктор",
-            "Сборка HTML-отчёта из блоков:\n"
-            "KPI, таблицы, текст\n"
-            "с живым предпросмотром в браузере",
+            "Отчёт",
+            "Сборка дашборда из блоков:\n"
+            "KPI, графики, таблицы, текст\n"
+            "и публикация в автономный HTML",
         )
         card_html.clicked.connect(lambda: self.navigate_to.emit("constructor"))
         cards_row.addWidget(card_html)
@@ -187,19 +204,19 @@ class StartPage(QWidget):
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet(f"""
             color: {t.text_muted};
-            font-size: 11px;
-            letter-spacing: 0.3px;
+            font-size: 12px;
+            letter-spacing: 0.5px;
             background: transparent;
             padding-top: 20px;
         """)
         root.addWidget(hint)
 
-        root.addSpacing(28)
+        root.addSpacing(32)
 
         # ── Копирайт ──
         copyright_lbl = QLabel(
-            "Все права на данную программу принадлежат: Рагимов В\n"
-            "По всем вопросам, можно обращаться в МТС Линк или на почту"
+            "Все права на данную программу принадлежат: В. Рагимов\n"
+            "По всем вопросам можно обращаться в МТС Линк или на почту"
         )
         copyright_lbl.setAlignment(Qt.AlignCenter)
         copyright_lbl.setStyleSheet(f"""

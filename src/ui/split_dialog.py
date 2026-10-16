@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QRadioButton, QCheckBox, QPushButton,
     QButtonGroup, QWidget, QGridLayout,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PySide6.QtCore import Qt, QTimer
 
@@ -30,7 +30,10 @@ SEPARATOR_PRESETS = [
 
 class SplitDialog(QDialog):
     """Диалог разделения колонки."""
-    
+
+    def _on_example_text_edited(self, text: str):
+        self._schedule_preview()
+
     def __init__(self, data, column_name: str, theme, parent=None):
         super().__init__(parent)
         
@@ -44,7 +47,7 @@ class SplitDialog(QDialog):
         
         self.setWindowTitle(f"Разделить колонку: {column_name}")
         self.setMinimumWidth(760)
-        self.setMinimumHeight(850)
+        self.setMinimumHeight(880)
         self.setStyleSheet(f"QDialog {{ background: {self.theme.bg_card}; }}")
         
         self._preview_timer = QTimer(self)
@@ -163,6 +166,55 @@ class SplitDialog(QDialog):
         return w
     
     # ============================================================
+    # Заполнение разнообразных примеров
+    # ============================================================
+    
+    def _populate_diverse_examples(self):
+        try:
+            self.table_examples.blockSignals(True)
+            self.table_examples.setRowCount(0)
+            
+            if self.column_name in self.data.dataframe.columns:
+                series = self.data.dataframe[self.column_name].dropna()
+                diverse = RuleDetector.get_diverse_examples(series, max_count=5)
+                
+                if not diverse:
+                    diverse = [str(series.iloc[0])] if len(series) > 0 else [""]
+                
+                self.table_examples.setRowCount(len(diverse))
+                for row, item_text in enumerate(diverse):
+                    text_str = str(item_text)
+                    self.table_examples.setRowHeight(row, 30)
+                    
+                    # Колонка 0: Исходный текст (только для чтения)
+                    item_src = QTableWidgetItem(text_str)
+                    item_src.setFlags(item_src.flags() & ~Qt.ItemIsEditable)
+                    self.table_examples.setItem(row, 0, item_src)
+                    
+                    # Колонка 1: Полноценное поле ввода QLineEdit с исходной строкой внутри
+                    line_edit = QLineEdit(text_str)
+                    line_edit.setProperty("original_text", text_str)
+                    line_edit.setStyleSheet(f"""
+                        QLineEdit {{
+                            background: {self.theme.bg_panel};
+                            color: {self.theme.text_main};
+                            border: 1px solid transparent;
+                            padding: 2px 6px;
+                            font-size: 11px;
+                        }}
+                        QLineEdit:focus {{
+                            background: {self.theme.bg_card};
+                            border: 1px solid {self.theme.primary};
+                        }}
+                    """)
+                    line_edit.textEdited.connect(self._on_example_text_edited)
+                    self.table_examples.setCellWidget(row, 1, line_edit)
+        except Exception as e:
+            print(f"[SplitDialog] Ошибка заполнения примеров: {e}")
+        finally:
+            self.table_examples.blockSignals(False)
+
+    # ============================================================
     # UI
     # ============================================================
     
@@ -229,12 +281,10 @@ class SplitDialog(QDialog):
         visual_layout.setContentsMargins(0, 6, 0, 6)
         visual_layout.setSpacing(8)
         
-        # Виджет визуального разделения
         self.visual_widget = VisualSplitWidget(self.example_text, self.theme)
         self.visual_widget.markers_changed.connect(self._on_markers_changed)
         visual_layout.addWidget(self.visual_widget)
         
-        # Пустая метка для правил (заполняется при клике)
         self.rules_label = QLabel("")
         self.rules_label.setStyleSheet(f"""
             color: {self.theme.text_muted};
@@ -247,7 +297,6 @@ class SplitDialog(QDialog):
         self.rules_label.setVisible(False)
         visual_layout.addWidget(self.rules_label)
         
-        # Список правил (без рамки, прозрачный)
         self.rules_list = QListWidget()
         self.rules_list.setFixedHeight(0)
         self.rules_list.setStyleSheet(f"""
@@ -268,7 +317,6 @@ class SplitDialog(QDialog):
         self.rules_list.setVisible(False)
         visual_layout.addWidget(self.rules_list)
         
-        # Предупреждение о точности
         self.accuracy_warning = QLabel("")
         self.accuracy_warning.setStyleSheet(f"""
             color: #f39c12;
@@ -357,7 +405,51 @@ class SplitDialog(QDialog):
         
         self.position_panel.setVisible(False)
         layout.addWidget(self.position_panel)
+
+        # === По примеру (Flash Fill / Интерактивный ввод) ===
+        self.radio_example = QRadioButton("4.  По примеру (Flash Fill / Интерактивный ввод)")
+        self.radio_example.setStyleSheet(self._radio_style())
+        self.mode_group.addButton(self.radio_example, 4)
+        layout.addWidget(self.radio_example)
         
+        self.example_panel = self._make_panel()
+        example_layout = QVBoxLayout(self.example_panel)
+        example_layout.setContentsMargins(0, 6, 0, 6)
+        example_layout.setSpacing(6)
+        
+        example_layout.addWidget(self._make_label("Отредактируйте желаемый результат для примеров (кликните в правый столбец и сотрите лишнее):"))
+        
+        self.table_examples = QTableWidget(0, 2)
+        self.table_examples.setMinimumHeight(130)
+        self.table_examples.setHorizontalHeaderLabels(["Исходный текст", "Желаемый результат"])
+        self.table_examples.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table_examples.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table_examples.verticalHeader().setVisible(False)
+        self.table_examples.setSelectionMode(QTableWidget.NoSelection)
+        self.table_examples.setStyleSheet(f"""
+            QTableWidget {{
+                background: {self.theme.bg_panel};
+                border: 1px solid {self.theme.border};
+                border-radius: 4px;
+                font-size: 11px;
+                color: {self.theme.text_main};
+                gridline-color: {self.theme.border};
+            }}
+            QHeaderView::section {{
+                background: {self.theme.bg_card};
+                color: {self.theme.primary};
+                padding: 4px;
+                border: none;
+                border-bottom: 1px solid {self.theme.border};
+                font-weight: bold;
+            }}
+        """)
+        
+        example_layout.addWidget(self.table_examples)
+        
+        self.example_panel.setVisible(False)
+        layout.addWidget(self.example_panel)
+
         # === По разделителю ===
         self.radio_separator = QRadioButton("3.  По разделителю")
         self.radio_separator.setChecked(True)
@@ -411,6 +503,40 @@ class SplitDialog(QDialog):
         custom_layout.addWidget(self.edit_custom_sep, 1)
         
         sep_layout.addWidget(custom_row)
+        
+        occurrence_row = QWidget()
+        occurrence_row.setStyleSheet("background: transparent; border: none;")
+        occurrence_layout = QHBoxLayout(occurrence_row)
+        occurrence_layout.setContentsMargins(0, 4, 0, 0)
+        occurrence_layout.setSpacing(16)
+        
+        occ_label = QLabel("Где резать:")
+        occ_label.setStyleSheet(self._label_style(muted=True))
+        occurrence_layout.addWidget(occ_label)
+        
+        self.occurrence_group = QButtonGroup(self)
+        
+        self.radio_occ_first = QRadioButton("По первому вхождению")
+        self.radio_occ_first.setChecked(True)
+        self.radio_occ_first.setStyleSheet(self._radio_style())
+        self.radio_occ_first.toggled.connect(self._schedule_preview)
+        self.occurrence_group.addButton(self.radio_occ_first, 0)
+        occurrence_layout.addWidget(self.radio_occ_first)
+        
+        self.radio_occ_last = QRadioButton("По последнему")
+        self.radio_occ_last.setStyleSheet(self._radio_style())
+        self.radio_occ_last.toggled.connect(self._schedule_preview)
+        self.occurrence_group.addButton(self.radio_occ_last, 1)
+        occurrence_layout.addWidget(self.radio_occ_last)
+        
+        self.radio_occ_all = QRadioButton("По всем вхождениям")
+        self.radio_occ_all.setStyleSheet(self._radio_style())
+        self.radio_occ_all.toggled.connect(self._schedule_preview)
+        self.occurrence_group.addButton(self.radio_occ_all, 2)
+        occurrence_layout.addWidget(self.radio_occ_all)
+        
+        occurrence_layout.addStretch()
+        sep_layout.addWidget(occurrence_row)
         
         layout.addWidget(self.separator_panel)
         
@@ -535,6 +661,7 @@ class SplitDialog(QDialog):
         
         self.radio_visual.setChecked(True)
         self._on_mode_changed(self.radio_visual)
+        self._populate_diverse_examples()
     
     # ============================================================
     # Логика
@@ -547,6 +674,7 @@ class SplitDialog(QDialog):
         self.marker_panel.setVisible(mode_id == 1)
         self.position_panel.setVisible(mode_id == 2)
         self.separator_panel.setVisible(mode_id == 3)
+        self.example_panel.setVisible(mode_id == 4)
         
         if mode_id == 0:
             n = len(self._detected_rules) + 1 if self._detected_rules else 2
@@ -567,20 +695,24 @@ class SplitDialog(QDialog):
             return "marker"
         elif mode_id == 2:
             return "position"
-        else:
+        elif mode_id == 3:
             return "separator"
-    
+        else:
+            return "example"
+
     def _get_current_params(self) -> dict:
         mode = self._get_current_mode()
         keep_spaces = self.check_keep_spaces.isChecked()
         
         if mode == "visual":
-            return {"markers": self.visual_widget.get_markers()}
+            return {"markers": self.visual_widget.get_markers(), "separator": "", "marker": "", "position": 0}
         elif mode == "marker":
             return {
                 "marker": self.edit_marker.text(),
                 "before": self.radio_before.isChecked(),
                 "keep_spaces": keep_spaces,
+                "separator": "",
+                "position": 0,
             }
         elif mode == "position":
             text = self.spin_position.text().strip()
@@ -588,7 +720,57 @@ class SplitDialog(QDialog):
                 position = int(text) if text else 0
             except ValueError:
                 position = 0
-            return {"position": position, "keep_spaces": keep_spaces}
+            return {"position": position, "keep_spaces": keep_spaces, "separator": "", "marker": ""}
+        elif mode == "example":
+            edited_pairs = []
+            all_pairs = []
+            
+            for r in range(self.table_examples.rowCount()):
+                src_item = self.table_examples.item(r, 0)
+                line_edit = self.table_examples.cellWidget(r, 1)
+                if src_item and isinstance(line_edit, QLineEdit):
+                    full_text = src_item.text()
+                    part_text = line_edit.text()
+                    if full_text and part_text:
+                        all_pairs.append((full_text, part_text))
+                        if full_text.strip() != part_text.strip():
+                            edited_pairs.append((full_text, part_text))
+            
+            series = self.data.dataframe[self.column_name].dropna().head(100)
+            rule = None
+            
+            if hasattr(RuleDetector, "detect_from_examples") and edited_pairs:
+                rule = RuleDetector.detect_from_examples(edited_pairs, series)
+            elif edited_pairs:
+                best_rule = None
+                best_score = -1.0
+                for sample_full, sample_part in edited_pairs:
+                    candidate = RuleDetector.detect_from_example(sample_full, sample_part, series)
+                    if candidate:
+                        match_user = 0
+                        for f_txt, p_txt in edited_pairs:
+                            pos = RuleDetector._find_split_position(candidate, f_txt)
+                            if pos is not None:
+                                left = f_txt[:pos].strip().rstrip(",;:|").strip()
+                                right = f_txt[pos:].strip().lstrip(",;:|").strip()
+                                p_clean = p_txt.strip().strip(",;:|").strip()
+                                if left == p_clean or right == p_clean:
+                                    match_user += 1
+                        score = (match_user / len(edited_pairs)) * 0.7 + candidate.accuracy * 0.3
+                        if score > best_score:
+                            best_score = score
+                            best_rule = candidate
+                rule = best_rule
+            
+            sample_text = edited_pairs[0][0] if edited_pairs else (all_pairs[0][0] if all_pairs else self.example_text)
+            return {
+                "rule": rule,
+                "sample": sample_text,
+                "keep_spaces": keep_spaces,
+                "separator": "",
+                "marker": "",
+                "position": 0,
+            }
         else:
             if self.radio_custom.isChecked():
                 sep = self.edit_custom_sep.text()
@@ -598,7 +780,17 @@ class SplitDialog(QDialog):
                     sep = SEPARATOR_PRESETS[sep_id][0]
                 else:
                     sep = ", "
-            return {"separator": sep, "keep_spaces": keep_spaces}
+            
+            occ_id = self.occurrence_group.checkedId()
+            occurrence = "first" if occ_id == 0 else ("last" if occ_id == 1 else "all")
+            
+            return {
+                "separator": sep,
+                "occurrence": occurrence,
+                "keep_spaces": keep_spaces,
+                "marker": "",
+                "position": 0,
+            }
     
     def _rebuild_name_fields(self, count: int):
         old_values = [e.text() for e in self.name_edits]
@@ -665,7 +857,6 @@ class SplitDialog(QDialog):
             text = f"{icon}  {rule.describe()}  —  {rule.accuracy:.0%} ({rule.success_count}/{rule.total_count})"
             self.rules_list.addItem(QListWidgetItem(text))
         
-        # Фиксируем высоту по количеству правил
         h = 22 * len(self._detected_rules) + 8
         self.rules_list.setFixedHeight(min(100, h))
         self.rules_list.setVisible(True)
@@ -690,6 +881,30 @@ class SplitDialog(QDialog):
             return
         
         params = self._get_current_params()
+        
+        if mode == "example":
+            rule = params.get("rule")
+            if not rule:
+                self._show_preview_empty("Отредактируйте хотя бы один пример в таблице выше (сотрите лишнюю часть строки)")
+                self._set_preview_headers(2)
+                return
+            
+            series = self.data.dataframe[self.column_name].dropna().head(5)
+            self._set_preview_headers(2)
+            for value in series:
+                s = str(value)
+                pos = RuleDetector._find_split_position(rule, s)
+                if pos is not None and 0 < pos < len(s):
+                    if params.get("keep_spaces"):
+                        p1, p2 = s[:pos], s[pos:]
+                    else:
+                        p1 = s[:pos].strip().rstrip(",;:|").strip()
+                        p2 = s[pos:].strip().lstrip(",;:|").strip()
+                else:
+                    p1, p2 = s.strip(), ""
+                self.preview_left.addItem(QListWidgetItem(p1 or "—"))
+                self.preview_right.addItem(QListWidgetItem(p2 or "—"))
+            return
         
         if mode == "marker" and not params["marker"]:
             self._show_preview_empty("Введите метку для разделения")
@@ -829,6 +1044,10 @@ class SplitDialog(QDialog):
             if not self._detected_rules:
                 ToastManager.warning("Правило не определено", "Не удалось определить правило", self.theme)
                 return
+        elif mode == "example":
+            if not params.get("rule"):
+                ToastManager.warning("Правило не определено", "Отредактируйте хотя бы один пример в таблице (сотрите лишнюю часть)", self.theme)
+                return
         
         names = []
         for edit in self.name_edits:
@@ -849,6 +1068,14 @@ class SplitDialog(QDialog):
                 "new_names": names,
                 "delete_original": self.check_delete_original.isChecked(),
             }
+        elif mode == "example":
+            rule = params.get("rule")
+            self.result_data = {
+                "mode": "visual",
+                "rules": [rule] if rule else [],
+                "new_names": names,
+                "delete_original": self.check_delete_original.isChecked(),
+            }
         else:
             self.result_data = {
                 "mode": mode,
@@ -858,3 +1085,47 @@ class SplitDialog(QDialog):
             }
         
         self.accept()
+    def _populate_diverse_examples(self):
+        try:
+            self.table_examples.blockSignals(True)
+            self.table_examples.setRowCount(0)
+            
+            if self.column_name in self.data.dataframe.columns:
+                series = self.data.dataframe[self.column_name].dropna()
+                diverse = RuleDetector.get_diverse_examples(series, max_count=5)
+                
+                if not diverse:
+                    diverse = [str(series.iloc[0])] if len(series) > 0 else [""]
+                
+                self.table_examples.setRowCount(len(diverse))
+                for row, item_text in enumerate(diverse):
+                    text_str = str(item_text)
+                    self.table_examples.setRowHeight(row, 30)
+                    
+                    # Колонка 0: Исходный текст (только для чтения)
+                    item_src = QTableWidgetItem(text_str)
+                    item_src.setFlags(item_src.flags() & ~Qt.ItemIsEditable)
+                    self.table_examples.setItem(row, 0, item_src)
+                    
+                    # Колонка 1: Полноценное поле ввода QLineEdit с исходной строкой внутри
+                    line_edit = QLineEdit(text_str)
+                    line_edit.setProperty("original_text", text_str)
+                    line_edit.setStyleSheet(f"""
+                        QLineEdit {{
+                            background: {self.theme.bg_panel};
+                            color: {self.theme.text_main};
+                            border: 1px solid transparent;
+                            padding: 2px 6px;
+                            font-size: 11px;
+                        }}
+                        QLineEdit:focus {{
+                            background: {self.theme.bg_card};
+                            border: 1px solid {self.theme.primary};
+                        }}
+                    """)
+                    line_edit.textEdited.connect(self._on_example_text_edited)
+                    self.table_examples.setCellWidget(row, 1, line_edit)
+        except Exception as e:
+            print(f"[SplitDialog] Ошибка заполнения примеров: {e}")
+        finally:
+            self.table_examples.blockSignals(False)

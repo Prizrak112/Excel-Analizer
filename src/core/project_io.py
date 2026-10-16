@@ -273,29 +273,39 @@ class ProjectIO:
             return None, f"Файл не найден: {path}"
 
         try:
+            if not os.path.exists(path):
+                return None, f"Файл не найден: {path}"
+        try:
             with zipfile.ZipFile(path, "r") as z:
                 # 1. manifest
                 try:
                     manifest_bytes = z.read("manifest.json")
                     manifest = json.loads(manifest_bytes.decode("utf-8"))
                 except KeyError:
-                    return None, "Неверный формат файла: нет manifest.json"
+                    return None, "NOT_A_PROJECT"
+                except json.JSONDecodeError:
+                    return None, "Неверный формат файла: поврежден манифест проекта"
 
                 # 2. payload.enc
                 try:
                     encrypted = z.read("payload.enc")
                 except KeyError:
-                    return None, "Неверный формат файла: нет payload.enc"
+                    return None, "NOT_A_PROJECT"
+
+        except zipfile.BadZipFile:
+            return None, "NOT_A_PROJECT"
+        except Exception as e:
+            return None, f"Ошибка чтения архива: {type(e).__name__}: {e}"
 
             # 3. Проверка версии
-            fmt_ver = int(manifest.get("format_version", 0))
-            if fmt_ver != FORMAT_VERSION:
-                return None, (
-                    f"Формат проекта не поддерживается "
-                    f"(v{fmt_ver}, ожидается v{FORMAT_VERSION})"
-                )
+        fmt_ver = int(manifest.get("format_version", 0))
+        if fmt_ver != FORMAT_VERSION:
+            return None, (
+                f"Формат проекта не поддерживается "
+                f"(v{fmt_ver}, ожидается v{FORMAT_VERSION})"
+            )
 
-            encryption = manifest.get("encryption", "machine")
+        encryption = manifest.get("encryption", "machine")
             salt_hex = manifest.get("salt", "")
             expected_check = manifest.get("check", "")
 
@@ -327,9 +337,12 @@ class ProjectIO:
                 else:
                     return None, "MACHINE_MISMATCH"
 
-            # 7. Декомпрессия + распаковка
-            raw = zlib.decompress(compressed)
-            state = pickle.loads(raw)
+            # 7. Декомпрессия + распаковка с защитой от битых данных
+            try:
+                raw = zlib.decompress(compressed)
+                state = pickle.loads(raw)
+            except Exception as e:
+                return None, f"Ошибка распаковки данных проекта: {type(e).__name__}: {e}"
 
             # 8. Восстановление FileEntry
             entries = [_dict_to_entry(d) for d in state.get("files", [])]

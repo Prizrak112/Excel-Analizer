@@ -1,9 +1,10 @@
 """
 Виджет редактора данных на основе QTableView.
-Переключатель листов + кнопка «Изменить сводную».
+Оптимизировано для сверхбольших датасетов (150k+ строк).
 """
 
 import pandas as pd
+import numpy as np
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableView,
@@ -31,6 +32,9 @@ class DataFrameModel(QAbstractTableModel):
         self._n_rows = len(df)
         self._n_cols = len(df.columns)
         self._columns = list(df.columns)
+        
+        # Кэшируем в чистый NumPy массив для мгновенного доступа
+        self._data_array = df.to_numpy()
 
     def rowCount(self, parent=QModelIndex()):
         return self._n_rows
@@ -46,17 +50,25 @@ class DataFrameModel(QAbstractTableModel):
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
+        
         row = index.row()
         col = index.column()
-        value = self._df.iat[row, col]
+        
+        # Читаем из сверхбыстрого кэша NumPy
+        value = self._data_array[row, col]
 
         if role == Qt.DisplayRole:
             if value is None:
                 return ""
+            
+            # Быстрая проверка на NaN для float
+            if type(value) is float and value != value:
+                return "—"
             if self._isna(value):
                 return "—"
+                
             if isinstance(value, float):
-                if value == int(value):
+                if value.is_integer():
                     return f"{int(value):,}"
                 return f"{value:,.2f}"
             if isinstance(value, int):
@@ -64,9 +76,7 @@ class DataFrameModel(QAbstractTableModel):
             return str(value)
 
         elif role == Qt.EditRole:
-            # ★ Отдаём «сырое» значение — редактор при двойном клике
-            #   откроется с текущим содержимым ячейки, а не пустым.
-            if value is None or self._isna(value):
+            if value is None or (type(value) is float and value != value) or self._isna(value):
                 return ""
             return str(value) if not isinstance(value, str) else value
 
@@ -76,7 +86,7 @@ class DataFrameModel(QAbstractTableModel):
             return _ALIGN_LEFT
 
         elif role == Qt.ForegroundRole:
-            if self._isna(value):
+            if (type(value) is float and value != value) or self._isna(value):
                 return _COLOR_NA
 
         return None
@@ -88,6 +98,7 @@ class DataFrameModel(QAbstractTableModel):
         col = index.column()
         try:
             self._df.iat[row, col] = value
+            self._data_array[row, col] = value
         except Exception:
             return False
         self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
@@ -112,6 +123,7 @@ class DataFrameModel(QAbstractTableModel):
         self._n_rows = len(df)
         self._n_cols = len(df.columns)
         self._columns = list(df.columns)
+        self._data_array = df.to_numpy()
         self.endResetModel()
 
 
@@ -163,44 +175,15 @@ class DataViewerWidget(QWidget):
         top_layout.setContentsMargins(16, 8, 16, 8)
         top_layout.setSpacing(10)
 
-        # ── Переключатель листов ──
         self.combo_sheets = QComboBox()
         self.combo_sheets.setVisible(False)
         self.combo_sheets.setMinimumWidth(200)
-        self.combo_sheets.setStyleSheet(f"""
-            QComboBox {{
-                background: {self.theme.bg_panel};
-                color: {self.theme.text_main};
-                border: 1px solid {self.theme.border};
-                border-radius: 6px;
-                padding: 6px 12px;
-                font-size: 13px;
-                font-weight: 600;
-            }}
-            QComboBox:hover {{
-                border: 1px solid {self.theme.primary};
-            }}
-            QComboBox::drop-down {{
-                border: none;
-                width: 24px;
-            }}
-            QComboBox QAbstractItemView {{
-                background: {self.theme.bg_card};
-                color: {self.theme.text_main};
-                border: 1px solid {self.theme.border};
-                selection-background-color: {self.theme.primary_hover};
-                selection-color: {self.theme.text_main};
-                padding: 4px;
-                font-size: 13px;
-            }}
-        """)
         self.combo_sheets.currentTextChanged.connect(self._on_sheet_changed)
         self.combo_sheets.setToolTip("ПКМ — переименовать лист")
         self.combo_sheets.setContextMenuPolicy(Qt.CustomContextMenu)
         self.combo_sheets.customContextMenuRequested.connect(self._on_sheet_context_menu)
         top_layout.addWidget(self.combo_sheets)
 
-        # ── Кнопка «Изменить сводную» ──
         self.btn_edit_pivot = QPushButton("✏  Изменить сводную")
         self.btn_edit_pivot.setVisible(False)
         self.btn_edit_pivot.setCursor(Qt.PointingHandCursor)
@@ -224,7 +207,8 @@ class DataViewerWidget(QWidget):
         self.label_info = QLabel("")
         self.label_info.setStyleSheet(f"""
             color: {self.theme.text_muted};
-            font-size: 11px;
+            font-size: 12px;
+            font-weight: 500;
             letter-spacing: 0.3px;
             background: transparent;
             border: none;
@@ -240,15 +224,18 @@ class DataViewerWidget(QWidget):
         self.table.setSortingEnabled(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table.setEditTriggers(
-            QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed
-        )
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.table.verticalHeader().setDefaultSectionSize(26)
-        self.table.verticalHeader().setMinimumWidth(52)
         self.table.setFrameShape(QFrame.NoFrame)
         self.table.setShowGrid(False)
+
+        # Оптимизации производительности
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.table.verticalHeader().setDefaultSectionSize(28)
+        self.table.verticalHeader().setMinimumWidth(52)
+        self.table.verticalHeader().setHighlightSections(False)
 
         self._header = FilterHeader(Qt.Horizontal, self.theme, self.table)
         self.table.setHorizontalHeader(self._header)
@@ -256,11 +243,12 @@ class DataViewerWidget(QWidget):
         self._header.setCascadingSectionResizes(False)
         self._header.setSectionsMovable(True)
         self._header.setSectionsClickable(True)
+        self._header.setHighlightSections(False)
         self._header.setFixedHeight(36)
+        
         self._header.sectionClicked.connect(self._on_header_clicked)
         self._header.sectionDoubleClicked.connect(self._on_header_double_clicked)
         self._header.filter_clicked.connect(self._on_filter_clicked)
-        self._header.sort_clicked.connect(self._on_sort_clicked)
         self._header.setContextMenuPolicy(Qt.CustomContextMenu)
         self._header.customContextMenuRequested.connect(self._on_header_context_menu)
 
@@ -273,101 +261,35 @@ class DataViewerWidget(QWidget):
                 alternate-background-color: {self.theme.bg_panel};
                 gridline-color: transparent;
                 color: {self.theme.text_main};
-                font-size: 12px;
+                font-size: 13px;
                 border: none;
                 outline: none;
                 selection-background-color: {self.theme.primary_hover};
                 selection-color: {self.theme.text_main};
             }}
-            QTableView::item {{
-                padding: 4px 8px;
-                border: none;
-            }}
-            QTableView::item:selected {{
-                background: {self.theme.primary_hover};
-                color: {self.theme.text_main};
-            }}
-            /* ★ Редактор ячейки — непрозрачный, без больших отступов и
-               скруглений, чтобы полностью накрывать содержимое ячейки
-               и не пропускать старый текст. */
+            QTableView::item {{ padding: 0px 8px; border: none; }}
+            QTableView::item:selected {{ background: {self.theme.primary_hover}; color: {self.theme.text_main}; font-weight: 500; }}
             QTableView QLineEdit {{
-                background: {self.theme.bg_panel};
+                background: {self.theme.bg_card};
                 color: {self.theme.text_main};
-                border: 1px solid {self.theme.primary};
-                border-radius: 0px;
+                border: 2px solid {self.theme.primary};
+                border-radius: 4px;
                 padding: 0px 6px;
-                margin: 0px;
-                font-size: 12px;
-                selection-background-color: {self.theme.primary_hover};
-                selection-color: {self.theme.text_main};
+                font-size: 13px;
             }}
-            QTableView::corner {{
-                background: {self.theme.bg_card};
-                border: none;
-            }}
-            QTableCornerButton::section {{
-                background: {self.theme.bg_card};
-                border: none;
-            }}
-            QHeaderView {{
-                background: {self.theme.bg_card};
-                border: none;
-            }}
+            QTableView::corner {{ background: {self.theme.bg_card}; border: none; }}
+            QTableCornerButton::section {{ background: {self.theme.bg_card}; border: none; }}
+            QHeaderView {{ background: {self.theme.bg_card}; border: none; }}
             QHeaderView::section {{
                 background: {self.theme.bg_card};
                 color: {self.theme.primary};
-                padding: 6px 10px;
+                padding: 6px 12px;
                 border: none;
                 border-bottom: 1px solid {self.theme.border};
                 font-weight: 600;
-                font-size: 11px;
-                letter-spacing: 0.3px;
+                font-size: 12px;
             }}
-            QHeaderView::section:hover {{
-                background: {self.theme.bg_panel};
-            }}
-            QScrollBar:vertical {{
-                background: transparent;
-                width: 12px;
-                margin: 0;
-                border: none;
-            }}
-            QScrollBar::handle:vertical {{
-                background: {self.theme.border};
-                min-height: 30px;
-                border-radius: 5px;
-                margin: 3px 3px;
-            }}
-            QScrollBar::handle:vertical:hover {{
-                background: {self.theme.text_muted};
-            }}
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-                height: 0; background: none; border: none;
-            }}
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
-                background: none;
-            }}
-            QScrollBar:horizontal {{
-                background: transparent;
-                height: 12px;
-                margin: 0;
-                border: none;
-            }}
-            QScrollBar::handle:horizontal {{
-                background: {self.theme.border};
-                min-width: 30px;
-                border-radius: 5px;
-                margin: 3px 3px;
-            }}
-            QScrollBar::handle:horizontal:hover {{
-                background: {self.theme.text_muted};
-            }}
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-                width: 0; background: none; border: none;
-            }}
-            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
-                background: none;
-            }}
+            QHeaderView::section:hover {{ background: {self.theme.bg_panel}; }}
         """)
 
         tp_layout.addWidget(self.table, stretch=1)
@@ -381,36 +303,23 @@ class DataViewerWidget(QWidget):
         ep_layout.setSpacing(0)
         ep_layout.addStretch()
 
-        icon = QLabel("📊")
+        icon = QLabel("⬡")
         icon.setAlignment(Qt.AlignCenter)
-        icon.setStyleSheet("font-size: 72px; background: transparent;")
+        icon.setStyleSheet(f"color: {self.theme.primary}; font-size: 72px; background: transparent;")
         ep_layout.addWidget(icon)
 
         ep_layout.addSpacing(16)
 
         title = QLabel("Откройте файл, чтобы начать")
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(f"""
-            color: {self.theme.text_main};
-            font-size: 18px;
-            font-weight: 700;
-            background: transparent;
-        """)
+        title.setStyleSheet(f"color: {self.theme.text_main}; font-size: 18px; font-weight: 700; background: transparent;")
         ep_layout.addWidget(title)
 
         ep_layout.addSpacing(8)
 
-        subtitle = QLabel(
-            "Excel-файлы (.xlsx, .xls) или готовые проекты (.eaproj)\n"
-            "Перетащите в окно или нажмите Ctrl+O"
-        )
+        subtitle = QLabel("Перетащите Excel-файл (.xlsx) или проект (.eaproj) в это окно")
         subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setStyleSheet(f"""
-            color: {self.theme.text_muted};
-            font-size: 12px;
-            line-height: 1.6;
-            background: transparent;
-        """)
+        subtitle.setStyleSheet(f"color: {self.theme.text_muted}; font-size: 13px; background: transparent;")
         ep_layout.addWidget(subtitle)
 
         ep_layout.addStretch()
@@ -431,16 +340,17 @@ class DataViewerWidget(QWidget):
 
         n_cols = self._model.columnCount()
         rows = self._model.rowCount()
-        if rows <= 1000:
+        
+        # Для больших файлов полностью отключаем авторасчет ширины по контенту
+        if rows <= 2000:
             self.table.resizeColumnsToContents()
             for col in range(n_cols):
                 if self.table.columnWidth(col) > 300:
                     self.table.setColumnWidth(col, 300)
         else:
             for col in range(n_cols):
-                self.table.setColumnWidth(col, 150)
+                self.table.setColumnWidth(col, 160)
 
-        # ★ Фиксируем Interactive-режим и «замораживаем» ширины
         for col in range(n_cols):
             self._header.setSectionResizeMode(col, QHeaderView.Interactive)
             self._header.resizeSection(col, self.table.columnWidth(col))
@@ -452,7 +362,6 @@ class DataViewerWidget(QWidget):
         self._stack.setCurrentIndex(0)
 
     def set_sheets(self, names: list, active: str, is_pivot: bool = False):
-        """Заполнить переключатель листов + показать/скрыть кнопку."""
         self.combo_sheets.blockSignals(True)
         self.combo_sheets.clear()
         for n in names:
@@ -470,7 +379,6 @@ class DataViewerWidget(QWidget):
         self.sheet_switch_requested.emit(name)
 
     def _on_sheet_context_menu(self, pos):
-        """ПКМ по combo-переключателю листов."""
         if self.combo_sheets.count() == 0:
             return
         current = self.combo_sheets.currentText()
@@ -516,10 +424,6 @@ class DataViewerWidget(QWidget):
         if self._header is not None:
             self._header.set_sort_state(indices)
 
-    # ============================================================
-    # Поиск
-    # ============================================================
-
     def find_all(self, text: str, case_sensitive: bool, scope: str) -> list:
         if self._model is None or not text:
             return []
@@ -563,18 +467,19 @@ class DataViewerWidget(QWidget):
     def clear_find(self):
         self.table.clearSelection()
 
-    # ============================================================
-    # Обработчики
-    # ============================================================
-
     def _on_header_clicked(self, index: int):
         if not (0 <= index < len(self._real_columns)):
             return
+        
+        # Проверяем зажатый Shift для мультисортировки
+        from PySide6.QtWidgets import QApplication
+        shift = bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)
+        
+        # Также обновляем выбранную колонку для инспектора
         real = self._real_columns[index]
-        if real == self._last_selected_col:
-            return
-        self._last_selected_col = real
-        self.column_selected.emit(real)
+        if real != self._last_selected_col:
+            self._last_selected_col = real
+            self.column_selected.emit(real)
 
     def _on_header_double_clicked(self, index: int):
         if index < 0 or index >= len(self._real_columns):
@@ -612,9 +517,6 @@ class DataViewerWidget(QWidget):
         if index < 0 or index >= len(self._real_columns):
             return
 
-        # ★ Мультивыбор: берём все колонки, охваченные выделенными ячейками
-        #   таблицы. Если правый клик по невыделенной колонке — работаем
-        #   только с ней (одна колонка).
         sm = self.table.selectionModel()
         selected_cols: set[int] = set()
         if sm is not None:
@@ -643,6 +545,7 @@ class DataViewerWidget(QWidget):
         action = menu.exec(self._header.mapToGlobal(pos))
         if action == action_delete:
             self.delete_columns_requested.emit(real_names)
+
     def _on_cell_context_menu(self, pos: QPoint):
         index = self.table.indexAt(pos)
         if not index.isValid():
@@ -664,7 +567,6 @@ class DataViewerWidget(QWidget):
 
         menu = QMenu(self)
 
-        # ── Удалить строки ──
         if len(rows) == 1:
             action_rows = menu.addAction(f"🗑  Удалить строку {rows[0] + 1}")
         else:
@@ -672,7 +574,6 @@ class DataViewerWidget(QWidget):
 
         menu.addSeparator()
 
-        # ── Удалить колонки ──
         if len(cols) == 1:
             c0 = cols[0]
             real = self._real_columns[c0] if 0 <= c0 < len(self._real_columns) else "?"

@@ -103,35 +103,24 @@ class LoadedData:
         current = self.sheet_name or "Sheet1"
 
         if old_name == current:
-            # Переименовываем активный
             self.sheet_name = new_name
+            # Синхронизируем sheet_states для активного листа, если они там были
+            if old_name in self.sheet_states:
+                self.sheet_states[new_name] = self.sheet_states.pop(old_name)
         elif old_name in self.extra_sheets:
-            # Переименовываем в extra_sheets, сохраняя порядок
-            new_extra = {}
-            for k, v in self.extra_sheets.items():
-                if k == old_name:
-                    new_extra[new_name] = v
-                else:
-                    new_extra[k] = v
-            self.extra_sheets = new_extra
+            self.extra_sheets[new_name] = self.extra_sheets.pop(old_name)
         else:
             return False, f"Лист «{old_name}» не найден"
 
-        # Спецификация сводной (если переименовываем саму сводную)
+        # Безопасный перенос спецификаций сводных таблиц
         if old_name in self.pivot_specs:
-            new_specs = {}
-            for k, v in self.pivot_specs.items():
-                if k == old_name:
-                    new_specs[new_name] = v
-                else:
-                    new_specs[k] = v
-            self.pivot_specs = new_specs
+            self.pivot_specs[new_name] = self.pivot_specs.pop(old_name)
 
-        # Метаданные листа (если лист неактивный)
+        # Безопасный перенос метаданных по листам
         if old_name in self.sheet_states:
             self.sheet_states[new_name] = self.sheet_states.pop(old_name)
 
-        # Ссылки на этот лист в других сводных (source_sheet)
+        # Обновляем ссылки на этот лист в чужих сводных таблицах
         for _spec in self.pivot_specs.values():
             if _spec.get("source_sheet") == old_name:
                 _spec["source_sheet"] = new_name

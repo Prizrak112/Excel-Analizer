@@ -1,10 +1,10 @@
 """
 Модель блоков отчёта.
-Простые dataclass'ы — что именно показывать в отчёте.
+Содержит логику рендеринга всех типов блоков в HTML, включая продвинутые графики Plotly
+с поддержкой агрегаций, цветовых палитр, легенд и подложек.
 """
 
 import pandas as pd
-
 from dataclasses import dataclass, field
 
 
@@ -14,23 +14,20 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Block:
-    """Базовый блок."""
+    """Базовый блок отчёта."""
     id: str
     type: str
     title: str = ""
 
-    # Layout-параметры (из config, прокидываются в render)
     width: int = 100
     margin_top: int = 0
     margin_bottom: int = 14
     min_height: int = 0
 
     def render(self) -> str:
-        """Рендерит блок в HTML. Переопределяется в наследниках."""
         return f'<!-- block {self.id}: {self.type} -->'
 
     def wrap_layout(self, inner_html: str) -> str:
-        """Оборачивает блок в div с шириной и отступами."""
         width = self.width
         style = (
             f"flex: 0 0 {width}%; "
@@ -42,8 +39,6 @@ class Block:
         )
         if self.min_height and self.min_height > 0:
             style += f" min-height: {self.min_height}px;"
-            # ★ Чтобы внутренний block-card растянулся на всю высоту,
-            # нужен flex-column на layout-item.
             style += " display: flex; flex-direction: column;"
 
         return f'<div class="layout-item" style="{style}">{inner_html}</div>'
@@ -55,7 +50,6 @@ class Block:
 
 @dataclass
 class SectionTitleBlock(Block):
-    """Заголовок раздела. Поддерживает rich-text, если в title есть теги."""
     type: str = "section_title"
     raw_html: bool = False
 
@@ -63,27 +57,23 @@ class SectionTitleBlock(Block):
         if self.raw_html:
             title = _extract_body(self.title)
         else:
-            # Если пользователь ввёл простой текст — экранируем.
             title = _escape(self.title)
-        inner = f'<h1 class="section-title">{title}</h1>'
+        inner = f'<h1 class="section-title" id="{self.id}">{title}</h1>'
         return self.wrap_layout(inner)
 
 
 @dataclass
 class ParagraphBlock(Block):
-    """Параграф текста. Поддерживает HTML (rich-text)."""
     type: str = "paragraph"
     text: str = ""
     raw_html: bool = False
 
     def render(self) -> str:
         if self.raw_html:
-            # Rich-text: чистим Qt-обёртку и вставляем как есть.
             content = _extract_body(self.text)
             if not content.strip():
                 content = "<p></p>"
         else:
-            # Плейн-текст: как раньше — экранируем и режем по пустым строкам.
             safe = _escape(self.text)
             paragraphs = [
                 f"<p>{p.strip()}</p>"
@@ -103,11 +93,6 @@ class ParagraphBlock(Block):
 
 @dataclass
 class ListBlock(Block):
-    """Список пунктов.
-    Два режима:
-      - items=[...] + raw_html=False — простые пункты (экранируются).
-      - html="<ul>...</ul>"        — rich-text HTML целиком (тулбар).
-    """
     type: str = "list"
     items: list[str] = field(default_factory=list)
     html: str = ""
@@ -115,10 +100,8 @@ class ListBlock(Block):
 
     def render(self) -> str:
         if self.raw_html and self.html.strip():
-            # Rich-text: HTML уже готов (обычно <ul>/<ol> из Qt).
             content = _extract_body(self.html)
         else:
-            # Простой режим: строим <ul> из items.
             items_html = "".join(
                 f"<li>{_escape(item)}</li>" for item in self.items
             )
@@ -135,12 +118,9 @@ class ListBlock(Block):
 
 @dataclass
 class DividerBlock(Block):
-    """Разделитель между разделами."""
     type: str = "divider"
 
     def render(self) -> str:
-        # Divider — служебный элемент между разделами.
-        # Ширину игнорируем, всегда 100%.
         return '<div class="section-divider"></div>'
 
 
@@ -150,7 +130,6 @@ class DividerBlock(Block):
 
 @dataclass
 class KpiCard:
-    """Одна KPI-карточка."""
     label: str
     value: str
     accent: bool = False
@@ -158,7 +137,6 @@ class KpiCard:
 
 @dataclass
 class KpiRowBlock(Block):
-    """Ряд KPI-карточек."""
     type: str = "kpi_row"
     cards: list[KpiCard] = field(default_factory=list)
 
@@ -208,9 +186,6 @@ class DataTableBlock(Block):
 
         total_rows = len(df)
         truncated = False
-        # ★ Жёсткий потолок для preview = 1000 строк, чтобы HTML
-        #   не пух. max_rows задаёт высоту окна, preview_limit —
-        #   максимальное число строк, которые физически попадут в HTML.
         hard_cap = self.preview_limit if self.preview_limit and self.preview_limit > 0 else 1000
         if len(df) > hard_cap:
             df = df.head(hard_cap)
@@ -240,8 +215,7 @@ class DataTableBlock(Block):
 
         info = f"Всего строк: {total_rows}."
         if truncated:
-            info = (f"⚠ Показаны первые {self.preview_limit} "
-                    f"из {total_rows} строк (preview).")
+            info = f"⚠ Показаны первые {self.preview_limit} из {total_rows} строк (preview)."
 
         inner = f'''
         <div class="block" style="min-width:0; max-width:100%;">
@@ -290,8 +264,6 @@ class DataTableBlock(Block):
                 document.getElementById("{tbl_id}-payload").textContent
             );
 
-            // ★ Ширина = ширина родителя. Иначе canvas-datagrid растянется
-            //   под содержимое и вылезет за правый край.
             function hostWidth() {{
                 var w = el.clientWidth;
                 if (!w && el.parentNode) w = el.parentNode.clientWidth;
@@ -322,7 +294,6 @@ class DataTableBlock(Block):
                 }} catch (e) {{}}
             }});
 
-            // ── Поиск ──
             var btn = document.querySelector('.ea-table-search-btn[data-target="{tbl_id}"]');
             var inp = document.querySelector('.ea-table-search-input[data-target="{tbl_id}"]');
 
@@ -374,100 +345,217 @@ class DataTableBlock(Block):
             return f"{val:,}"
         return str(val)
 
+
+# ============================================================
+# График Plotly (Продвинутый генератор для HTML-экспорта)
+# ============================================================
+
+_PALETTE_HEX = {
+    "corporate": ["#2b7fff", "#87C800", "#ff9f1c", "#e71d36", "#6f42c1", "#20c997", "#fd7e14"],
+    "emerald":   ["#003F0B", "#2bb24c", "#87C800", "#52b788", "#74c69d", "#95d5b2", "#b7e4c7"],
+    "sunset":    ["#f72585", "#7209b7", "#3a0ca3", "#4361ee", "#4cc9f0", "#ff9e00", "#ff0055"],
+    "pastel":    ["#60a5fa", "#34d399", "#fbbf24", "#f87171", "#a78bfa", "#f472b6", "#38bdf8"],
+}
+
+
+@dataclass
+class PlotlyChartBlock(Block):
+    show_title: bool = True
+    show_axis_labels: bool = True
+    type: str = "plotly_chart"
+    dataframe: object = None
+    chart_type: str = "bar"
+    x_col: str = ""
+    y_col: str = ""
+    title: str = "График данных"
+    agg: str = "sum"
+    sort_by: str = "value_desc"
+    top_n: int = 12
+    row_start: int = 0
+    row_limit: int = 0
+    palette: str = "corporate"
+    bg_color: str = "#ffffff"
+    legend_pos: str = "right"
+    show_legend: bool = True
+    show_values: bool = True
+    show_grid: bool = True
+
+    def render(self) -> str:
+        if self.dataframe is None or len(self.dataframe) == 0:
+            return self.wrap_layout(self._render_empty("Нет данных (загрузите Excel)"))
+
+        df = self.dataframe
+        if self.row_start > 0 or self.row_limit > 0:
+            end_idx = (self.row_start + self.row_limit) if self.row_limit > 0 else len(df)
+            df = df.iloc[self.row_start:end_idx]
+
+        if not self.x_col or self.x_col not in df.columns:
+            self.x_col = df.columns[0]
+
+        try:
+            import plotly.express as px
+            import plotly.io as pio
+
+            work_df = df.copy()
+            if self.chart_type == "histogram":
+                fig = px.histogram(
+                    work_df,
+                    x=self.x_col,
+                    title=self.title if self.show_title else "",
+                    color_discrete_sequence=_PALETTE_HEX.get(self.palette, _PALETTE_HEX["corporate"]),
+                )
+            else:
+                if not self.y_col or self.y_col not in work_df.columns or self.agg == "count":
+                    grouped = work_df[self.x_col].astype(str).value_counts()
+                    y_label = "Количество записей"
+                    plot_df = pd.DataFrame({self.x_col: grouped.index, y_label: grouped.values})
+                    y_field = y_label
+                else:
+                    work_df[self.y_col] = pd.to_numeric(work_df[self.y_col], errors="coerce").fillna(0)
+                    if self.agg == "mean":
+                        grouped = work_df.groupby(work_df[self.x_col].astype(str))[self.y_col].mean()
+                    elif self.agg == "max":
+                        grouped = work_df.groupby(work_df[self.x_col].astype(str))[self.y_col].max()
+                    elif self.agg == "min":
+                        grouped = work_df.groupby(work_df[self.x_col].astype(str))[self.y_col].min()
+                    elif self.agg == "median":
+                        grouped = work_df.groupby(work_df[self.x_col].astype(str))[self.y_col].median()
+                    else:
+                        grouped = work_df.groupby(work_df[self.x_col].astype(str))[self.y_col].sum()
+                    y_label = str(self.y_col)
+                    plot_df = pd.DataFrame({self.x_col: grouped.index, y_label: grouped.values})
+                    y_field = y_label
+
+                if self.sort_by == "value_desc":
+                    plot_df = plot_df.sort_values(by=y_field, ascending=False)
+                elif self.sort_by == "value_asc":
+                    plot_df = plot_df.sort_values(by=y_field, ascending=True)
+                elif self.sort_by == "label_asc":
+                    plot_df = plot_df.sort_values(by=self.x_col, ascending=True)
+
+                if self.top_n > 0:
+                    plot_df = plot_df.head(self.top_n)
+
+                colors_list = _PALETTE_HEX.get(self.palette, _PALETTE_HEX["corporate"])
+                chart_title = self.title if self.show_title else ""
+
+                if self.chart_type == "bar":
+                    fig = px.bar(
+                        plot_df, x=self.x_col, y=y_field,
+                        color=self.x_col, color_discrete_sequence=colors_list,
+                        title=chart_title, text=y_field if self.show_values else None,
+                    )
+                    if self.show_values:
+                        fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+                elif self.chart_type == "hbar":
+                    fig = px.bar(
+                        plot_df, x=y_field, y=self.x_col,
+                        color=self.x_col, color_discrete_sequence=colors_list,
+                        orientation="h", title=chart_title, text=y_field if self.show_values else None,
+                    )
+                    if self.show_values:
+                        fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+                elif self.chart_type == "line":
+                    fig = px.line(plot_df, x=self.x_col, y=y_field, title=chart_title, markers=True)
+                    fig.update_traces(line=dict(color=colors_list[0], width=3))
+                elif self.chart_type == "area":
+                    fig = px.area(plot_df, x=self.x_col, y=y_field, title=chart_title)
+                elif self.chart_type == "scatter":
+                    fig = px.scatter(
+                        plot_df, x=self.x_col, y=y_field,
+                        color=self.x_col, color_discrete_sequence=colors_list, title=chart_title,
+                    )
+                elif self.chart_type in ("pie", "donut"):
+                    fig = px.pie(
+                        plot_df, names=self.x_col, values=y_field,
+                        color_discrete_sequence=colors_list, title=chart_title,
+                        hole=0.52 if self.chart_type == "donut" else 0.0,
+                    )
+                elif self.chart_type == "box":
+                    fig = px.box(work_df, y=self.y_col if self.y_col else self.x_col, title=chart_title, color_discrete_sequence=colors_list)
+                elif self.chart_type == "funnel":
+                    fig = px.funnel(
+                        plot_df, x=y_field, y=self.x_col,
+                        color=self.x_col, color_discrete_sequence=colors_list, title=chart_title,
+                    )
+                else:
+                    fig = px.bar(plot_df, x=self.x_col, y=y_field, title=chart_title)
+
+            bg_hex = (self.bg_color or "#ffffff").lstrip('#')
+            if len(bg_hex) == 3:
+                bg_hex = ''.join([c * 2 for c in bg_hex])
+            try:
+                r_val, g_val, b_val = int(bg_hex[0:2], 16), int(bg_hex[2:4], 16), int(bg_hex[4:6], 16)
+                luminance = (0.299 * r_val + 0.587 * g_val + 0.114 * b_val) / 255
+                is_dark = luminance < 0.5
+            except Exception:
+                is_dark = False
+
+            text_color = "#f0f4f8" if is_dark else "#333333"
+            grid_color = "#334155" if is_dark else "#e2e8f0"
+
+            x_title_val = self.x_col if self.show_axis_labels else ""
+            y_title_val = (self.y_col if self.y_col else "Значения") if self.show_axis_labels else ""
+
+            legend_config = dict(title_text="", visible=bool(self.show_legend))
+            if self.legend_pos == "top":
+                legend_config.update(dict(orientation="h", yanchor="bottom", y=1.12, xanchor="center", x=0.5))
+            elif self.legend_pos == "bottom":
+                legend_config.update(dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5))
+            else:
+                legend_config.update(dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.02))
+
+            fig.update_layout(
+                plot_bgcolor=self.bg_color,
+                paper_bgcolor=self.bg_color,
+                font=dict(family="Segoe UI, sans-serif", size=12, color=text_color),
+                margin=dict(l=45, r=50, t=55 if (self.title and self.show_title) else 25, b=65),
+                title=dict(font=dict(size=15, color=text_color, family="Segoe UI, sans-serif")),
+                xaxis=dict(title=dict(text=x_title_val), showgrid=bool(self.show_grid), gridcolor=grid_color, tickangle=-25),
+                yaxis=dict(title=dict(text=y_title_val), showgrid=bool(self.show_grid), gridcolor=grid_color),
+                legend=legend_config,
+                autosize=True,
+            )
+
+            chart_div = pio.to_html(fig, include_plotlyjs="cdn", full_html=False)
+
+        except Exception as e:
+            chart_div = f"<p style='color:red;'>Ошибка построения графика: {e}</p>"
+
+        inner = f"""
+        <div class="block" style="min-width:0; max-width:100%;">
+            <div class="block-card" style="padding: 16px; background: {self.bg_color}; border-radius: 8px; min-width:0; max-width:100%;">
+                {chart_div}
+            </div>
+        </div>
+        """
+        return self.wrap_layout(inner)
+
+    def _render_empty(self, msg: str) -> str:
+        return f'''
+        <div class="block">
+            <div class="block-card" style="text-align:center; padding: 40px 20px; background: {self.bg_color};">
+                <p style="color:#888; font-size: 13px;">📊 График: {msg}</p>
+            </div>
+        </div>
+        '''
+
+
+# ============================================================
+# Контейнер (сетка)
+# ============================================================
+
 @dataclass
 class ContainerBlock(Block):
-    """
-    Контейнер с вложенными блоками.
-    layout: "row" (горизонтально) или "column" (вертикально).
-    gap: отступ между вложенными блоками (px).
-    children: список дочерних блоков (уже отрендеренных в HTML).
-    """
     type: str = "container"
     layout: str = "row"
     gap: int = 14
     children_html: list[str] = field(default_factory=list)
 
     def render(self) -> str:
-        if self.dataframe is None or len(self.dataframe) == 0:
-            return self.wrap_layout(self._render_empty())
-
-        if self.visible_columns is not None and len(self.visible_columns) == 0:
-            return self.wrap_layout(self._render_empty())
-
-        df = self.dataframe
-
-        if self.visible_columns is None:
-            cols = list(df.columns)
-        else:
-            cols = [c for c in self.visible_columns if c in df.columns]
-
-        if not cols:
-            return self.wrap_layout(self._render_empty())
-
-        df = df[cols]
-
-        # ★ НЕ режем строки. Всегда рендерим всю таблицу.
-        #   max_rows — это теперь ВЫСОТА ОКНА в строках:
-        #     > 0  → max-height ≈ N строк, внутри вертикальный скролл
-        #     <= 0 → высота авто (вся таблица развёрнута на странице)
-        total_rows = len(df)
-        max_rows_val = int(self.max_rows) if self.max_rows is not None else 20
-
-        ROW_PX = 30        # высота одной строки (под наш CSS)
-        HEADER_PX = 42     # высота шапки
-
-        if max_rows_val > 0:
-            window_h = HEADER_PX + max_rows_val * ROW_PX
-            wrapper_style = (
-                f"max-height: {window_h}px;"
-                f"overflow-y: auto;"
-                f"overflow-x: auto;"
-            )
-            footer_html = (
-                f'<div style="padding:8px 12px; font-size:12px; '
-                f'color:#888; border-top:1px solid #eee;">'
-                f'Всего строк: {total_rows}. '
-                f'Прокрутите таблицу, чтобы увидеть все.'
-                f'</div>'
-            )
-        else:
-            # 0 или отрицательное — «окно во всю таблицу»
-            wrapper_style = "overflow-x: auto;"
-            footer_html = (
-                f'<div style="padding:8px 12px; font-size:12px; '
-                f'color:#888; border-top:1px solid #eee;">'
-                f'Всего строк: {total_rows} (показаны все).'
-                f'</div>'
-            )
-
-        headers_html = "".join(
-            f"<th>{_escape(str(col))}</th>" for col in df.columns
-        )
-
-        rows_html = []
-        for _, row in df.iterrows():
-            cells = []
-            for col in df.columns:
-                val = row[col]
-                text = self._format_value(val)
-                cells.append(f"<td>{_escape(text)}</td>")
-            rows_html.append(f"<tr>{''.join(cells)}</tr>")
-
-        inner = f'''
-        <div class="block" style="min-width:0;">
-            <div class="block-card" style="padding: 0; min-width:0; overflow:hidden;">
-                <div class="data-table-wrapper"
-                     style="{wrapper_style} width:100%; max-width:100%;">
-                    <table class="data-table"
-                           style="width:max-content; min-width:100%;">
-                        <thead><tr>{headers_html}</tr></thead>
-                        <tbody>{''.join(rows_html)}</tbody>
-                    </table>
-                </div>
-                {footer_html}
-            </div>
-        </div>
-        '''
+        css_class = "container-row" if self.layout == "row" else "container-column"
+        style = f"gap: {self.gap}px;"
+        inner = f'<div class="{css_class}" style="{style}">{"".join(self.children_html)}</div>'
         return self.wrap_layout(inner)
 
 
@@ -476,7 +564,6 @@ class ContainerBlock(Block):
 # ============================================================
 
 def _escape(text: str) -> str:
-    """Простое экранирование HTML."""
     if not isinstance(text, str):
         text = str(text)
     return (
@@ -487,14 +574,6 @@ def _escape(text: str) -> str:
 
 
 def _extract_body(html: str) -> str:
-    """
-    Достаёт внутренности <body>…</body> из Qt-HTML.
-    Если <body> нет — возвращает исходную строку.
-
-    Qt QTextEdit.toHtml() отдаёт полный документ с <html>, <head>,
-    встроенными <style> и т.п. Для отчёта нам нужна только
-    содержательная часть.
-    """
     if not isinstance(html, str):
         return ""
     low = html.lower()

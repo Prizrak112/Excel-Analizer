@@ -1,5 +1,5 @@
 """
-Главное окно приложения Excel Analyzer.
+Главное окно приложения NexGrid.
 Стиль: современный dark dashboard.
 """
 
@@ -10,13 +10,14 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QTreeWidgetItem, QMenu,
+    QLabel, QPushButton, QTreeWidgetItem, QMenu, QMenuBar,
     QSplitter, QStackedWidget, QListWidget, QListWidgetItem,
     QTabWidget, QStatusBar, QToolBar, QFileDialog, QMessageBox, QInputDialog,
     QStyle, QFileIconProvider, QFrame, QAbstractItemView, QToolButton,
 )
 from PySide6.QtCore import Qt, QSize, QFileInfo, QTimer
-from PySide6.QtGui import QAction, QShortcut, QKeySequence
+from PySide6.QtGui import QAction, QShortcut, QKeySequence, QIcon, QPixmap, QPainter, QColor, QFont
+import ctypes
 
 from src.ui.constructor_tab import ConstructorTab
 from src.config.theme import get_theme, set_theme, toggle_theme
@@ -36,7 +37,7 @@ from src.ui.project_password_dialog import (
 )
 from src.ui.project_file_dialog import ProjectFileDialog
 from src.ui.folder_dialog import FolderOpenDialog
-from src.ui.pivot_dialog import PivotDialog
+# from src.ui.pivot_dialog import PivotDialog
 from src.ui.start_page import StartPage
 from src.ui.drop_dialog import DropDuplicatesDialog, DropNaDialog
 from src.ui.normalize_text_dialog import NormalizeTextDialog
@@ -184,7 +185,34 @@ def _list_qss(theme) -> str:
 
 class MainWindow(QMainWindow):
     """Главное окно приложения."""
+    def _create_app_icon(self) -> QIcon:
+        """Программно рисует нашу иконку ⬡ для системного окна."""
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        font = QFont("Segoe UI", 48)
+        painter.setFont(font)
+        painter.setPen(QColor("#87C800")) # Наш фирменный зеленый
+        
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "⬡")
+        painter.end()
+        
+        return QIcon(pixmap)
 
+    def _update_titlebar_color(self, is_dark: bool):
+        """Перекрашивает нативную шапку Windows 10/11 в темную или светлую."""
+        if os.name == 'nt':
+            try:
+                hwnd = int(self.winId())
+                # Константа DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                value = ctypes.c_int(1 if is_dark else 0)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 20, ctypes.byref(value), ctypes.sizeof(value)
+                )
+            except Exception:
+                pass # Игнорируем на старых версиях Windows
     def __init__(self):
         super().__init__()
 
@@ -208,6 +236,10 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_statusbar()
 
+        # Устанавливаем нашу иконку и цвет шапки
+        self.setWindowIcon(self._create_app_icon())
+        self._update_titlebar_color(self.theme.is_dark)
+
         self.setStyleSheet(self.theme.to_qss())
 
     # ============================================================
@@ -215,7 +247,11 @@ class MainWindow(QMainWindow):
     # ============================================================
 
     def _build_menu(self):
-        menubar = self.menuBar()
+        self.custom_menubar = QMenuBar()
+        menubar = self.custom_menubar
+        self.menuBar().hide()  # Скрываем старое системное меню
+
+        # ── «Правка» ──
 
         # ── «Правка» ──
         edit_menu = menubar.addMenu("Правка")
@@ -284,7 +320,7 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        action_export = QAction("Экспорт в HTML", self)
+        action_export = QAction("🌐  Публикация в HTML", self)
         action_export.setShortcut("Ctrl+E")
         file_menu.addAction(action_export)
 
@@ -417,34 +453,96 @@ class MainWindow(QMainWindow):
     # Навигация (в правом углу менюбара)
     # ============================================================
     def _build_top_nav(self) -> QWidget:
-        """Тонкая полоса навигации под менюбаром: Старт / Редактор / Конструктор."""
+        """Единый современный Header: Логотип + Меню + Навигация."""
         bar = QWidget()
-        bar.setFixedHeight(44)
-        bar.setStyleSheet(
-            f"background: {self.theme.bg_page}; "
-            f"border-bottom: 1px solid {self.theme.border};"
-        )
+        bar.setFixedHeight(56)
+        bar.setStyleSheet(f"""
+            QWidget {{
+                background: {self.theme.bg_card};
+                border: none;
+            }}
+        """)
         lay = QHBoxLayout(bar)
-        lay.setContentsMargins(16, 6, 16, 6)
-        lay.setSpacing(6)
+        lay.setContentsMargins(20, 0, 20, 0)
+        lay.setSpacing(16)
+
+        # 1. Логотип / Название (разделен на 2 виджета для идеального выравнивания)
+        logo_container = QWidget()
+        logo_container.setStyleSheet("background: transparent; border: none;")
+        logo_lay = QHBoxLayout(logo_container)
+        logo_lay.setContentsMargins(0, 0, 0, 0)
+        logo_lay.setSpacing(6)  # <-- Жёстко контролируемый отступ (6px)
+
+        icon_label = QLabel("⬡")
+        icon_label.setStyleSheet(f"""
+            color: {self.theme.primary};
+            font-size: 34px;
+            font-weight: normal;
+            margin-bottom: 4px; /* Визуальная компенсация глифа для центрирования */
+        """)
+        icon_label.setAlignment(Qt.AlignVCenter)
+
+        text_label = QLabel("<b>NEX</b>GRID")
+        text_label.setStyleSheet(f"""
+            color: {self.theme.text_main};
+            font-family: "Century Gothic", "Tw Cen MT", "Segoe UI", sans-serif;
+            font-size: 21px;
+            letter-spacing: 4px;
+        """)
+        text_label.setAlignment(Qt.AlignVCenter)
+
+        logo_lay.addWidget(icon_label)
+        logo_lay.addWidget(text_label)
+
+        lay.addWidget(logo_container)
+
+        # 2. Интегрированное меню
+        if hasattr(self, 'custom_menubar'):
+            self.custom_menubar.setStyleSheet(f"""
+                QMenuBar {{ background: transparent; border: none; }}
+                QMenuBar::item {{ padding: 6px 12px; border-radius: 6px; font-weight: 500; font-size: 13px; color: {self.theme.text_muted}; }}
+                QMenuBar::item:selected {{ background: {self.theme.bg_panel}; color: {self.theme.text_main}; }}
+            """)
+            lay.addWidget(self.custom_menubar)
+
+        lay.addStretch()
+
+        # 3. Навигационные вкладки
+        nav_container = QWidget()
+        nav_container.setStyleSheet("background: transparent; border: none;")
+        nav_lay = QHBoxLayout(nav_container)
+        nav_lay.setContentsMargins(0, 0, 0, 0)
+        nav_lay.setSpacing(8)
 
         self._nav_buttons = []
-
         def _make(label: str, page: int) -> QPushButton:
             b = QPushButton(label)
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
-            b.setStyleSheet(self._nav_btn_qss())
+            b.setFixedHeight(34)
+            b.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent;
+                    color: {self.theme.text_muted};
+                    border: none;
+                    padding: 0 16px;
+                    border-radius: 8px;
+                    font-size: 13px;
+                    font-weight: 600;
+                }}
+                QPushButton:hover {{ background: {self.theme.bg_panel}; color: {self.theme.text_main}; }}
+                QPushButton:checked {{ background: {self.theme.bg_hover}; color: {self.theme.text_main}; }}
+            """)
             b.clicked.connect(lambda _checked=False, p=page: self._switch_page(p))
-            lay.addWidget(b)
+            nav_lay.addWidget(b)
             self._nav_buttons.append(b)
             return b
 
-        _make("🏠   Старт", 0)
-        _make("📊   Редактор", 1)
-        _make("🎨   Конструктор", 2)
+        _make("🏠  Старт", 0)
+        _make("📊  Данные", 1)
+        _make("🎨  Отчёт", 2)
 
-        lay.addStretch()
+        lay.addWidget(nav_container)
         return bar
 
     def _nav_btn_qss(self) -> str:
@@ -529,7 +627,7 @@ class MainWindow(QMainWindow):
         bar.setFixedHeight(44)
         bar.setStyleSheet(f"""
             #top_toolbar {{
-                background: {self.theme.bg_page};
+                background: {self.theme.bg_card};
                 border: none;
                 border-bottom: 1px solid {self.theme.border};
             }}
@@ -609,20 +707,8 @@ class MainWindow(QMainWindow):
 
         _sep()
 
-        for text, tooltip in [
-            ("📊   Данные", "Блок данных"),
-            ("📈   График", "Блок графика"),
-            ("🔢   KPI", "KPI-показатель"),
-            ("📝   Текст", "Текстовый блок"),
-        ]:
-            a = QAction(text, self)
-            a.setToolTip(tooltip)
-            _add(a)
-
-        _sep()
-
-        a_export = QAction("🌐   Экспорт HTML", self)
-        a_export.setToolTip("Экспорт в автономный HTML")
+        a_export = QAction("🌐  Публикация HTML", self)
+        a_export.setToolTip("Сохранить в автономный HTML-дашборд")
         a_export.triggered.connect(self._on_export_html_toolbar)
         _add(a_export)
 
@@ -712,7 +798,7 @@ class MainWindow(QMainWindow):
         sep3.setFixedHeight(20)
         lay.addWidget(sep3)
 
-        _add("🌐   Экспорт HTML", "Экспорт в автономный HTML", lambda: None)
+        _add("🌐  Публикация HTML", "Сохранить в автономный HTML-дашборд", lambda: None)
 
         lay.addStretch()
         return bar
@@ -757,11 +843,12 @@ class MainWindow(QMainWindow):
         self._left_panel = left_panel
         self._left_panel_expanded_width = 300
         self._left_panel_collapsed = False
-        self._current_page = 0
 
         self.setCentralWidget(root)
 
-        QTimer.singleShot(0, lambda: self._apply_page_layout(0))
+        # Вызываем напрямую: таймер ломал видимость панелей при смене темы
+        current = getattr(self, "_current_page", 0)
+        self._apply_page_layout(current)
 
     def _build_left_panel(self) -> QWidget:
         widget = QWidget()
@@ -769,7 +856,7 @@ class MainWindow(QMainWindow):
         widget.setMinimumWidth(70)
 
         outer = QVBoxLayout(widget)
-        outer.setContentsMargins(0, 8, 0, 8)
+        outer.setContentsMargins(0, 16, 0, 16)
         outer.setSpacing(0)
 
         # ═══ ШАПКА ═══
@@ -777,7 +864,7 @@ class MainWindow(QMainWindow):
         self.left_header.setFixedHeight(30)
         self.left_header.setStyleSheet("background: transparent;")
         header_lay = QHBoxLayout(self.left_header)
-        header_lay.setContentsMargins(8, 0, 8, 0)
+        header_lay.setContentsMargins(16, 0, 16, 0)
         header_lay.setSpacing(6)
 
         self.btn_toggle_left = QPushButton("<<")
@@ -838,7 +925,7 @@ class MainWindow(QMainWindow):
         self.left_content = QWidget()
         self.left_content.setStyleSheet("background: transparent;")
         layout = QVBoxLayout(self.left_content)
-        layout.setContentsMargins(12, 0, 10, 0)
+        layout.setContentsMargins(16, 0, 16, 0)
         layout.setSpacing(0)
 
         list_qss = _list_qss(self.theme)
@@ -1027,11 +1114,12 @@ class MainWindow(QMainWindow):
         self.data_viewer.sheet_rename_requested.connect(self._on_sheet_rename)
         self.editor_tabs.addTab(self.data_viewer, "📋   Данные")
 
+        self.editor_tabs.addTab(self.data_viewer, "📋  Таблица")
         self.code_editor = CodeEditorWidget(self.theme)
         self.code_editor.btn_refresh.clicked.connect(self._refresh_code)
         self.code_editor.btn_copy.clicked.connect(self.code_editor.copy_to_clipboard)
         self.code_editor.btn_save.clicked.connect(self._save_code)
-        self.editor_tabs.addTab(self.code_editor, "🐍   Код")
+        self.editor_tabs.addTab(self.code_editor, "🐍  Скрипт")
 
         self.editor_tabs.currentChanged.connect(self._on_editor_subtab_changed)
         self.pages.addWidget(self.editor_tabs)
@@ -1165,7 +1253,7 @@ class MainWindow(QMainWindow):
             border-bottom: 1px solid {self.theme.border};
         """)
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(16, 12, 10, 12)
+        header_layout.setContentsMargins(20, 16, 16, 16)
         header_layout.setSpacing(8)
 
         label = QLabel(title)
@@ -1207,7 +1295,7 @@ class MainWindow(QMainWindow):
         body = QWidget()
         body.setStyleSheet("background: transparent; border: none;")
         body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(14, 12, 14, 14)
+        body_layout.setContentsMargins(20, 16, 20, 24)
         body_layout.setSpacing(0)
         body_layout.addWidget(widget)
         card_layout.addWidget(body, stretch=1)
@@ -1779,8 +1867,8 @@ class MainWindow(QMainWindow):
             self.top_nav.setVisible(not is_start)
 
         # ── Менюбар целиком скрываем на Старте ──
-        if self.menuBar() is not None:
-            self.menuBar().setVisible(not is_start)
+        if hasattr(self, "custom_menubar"):
+            self.custom_menubar.setVisible(not is_start)
 
         # ── Меню «Отчёт» убрано — проверяем на None для совместимости ──
         if getattr(self, "report_menu", None) is not None:
@@ -1897,7 +1985,7 @@ class MainWindow(QMainWindow):
             mode="save",
             title="Сохранить проект",
             filters=[
-                ("Проекты Excel Analyzer (*.eaproj)", "*.eaproj"),
+                ("Проекты NexGrid (*.eaproj)", "*.eaproj"),
                 ("Все файлы (*)", "*"),
             ],
             start_dir=last_dir,
@@ -1996,10 +2084,10 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Это не файл проекта",
-                    f"Файл не является проектом Excel Analyzer:\n\n"
+                    f"Файл не является проектом NexGrid:\n\n"
                     f"{filepath}\n\n"
                     f"Возможные причины:\n"
-                    f"  • файл не был создан в Excel Analyzer (например, "
+                    f"  • файл не был создан в NexGrid (например, "
                     f"это переименованный .xlsx или .txt);\n"
                     f"  • файл повреждён или не до конца скопирован;\n"
                     f"  • расширение .eaproj установлено вручную.\n\n"
@@ -2137,6 +2225,9 @@ class MainWindow(QMainWindow):
                 if col_info:
                     self.inspector.show_column(col_info)
 
+        # Синхронизируем цвет системной шапки
+        self._update_titlebar_color(self.theme.is_dark)
+
         effect = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(effect)
         fade_in = QPropertyAnimation(effect, b"opacity")
@@ -2161,7 +2252,8 @@ class MainWindow(QMainWindow):
 
         self.setStyleSheet(self.theme.to_qss())
 
-        self.menuBar().clear()
+        if hasattr(self, "custom_menubar"):
+            self.custom_menubar.deleteLater()
         self._build_menu()
 
         for toolbar in self.findChildren(QToolBar):
@@ -2270,7 +2362,7 @@ class MainWindow(QMainWindow):
             filters=[
                 ("Excel и проекты (*.xlsx *.xls *.eaproj)", "*.xlsx *.xls *.eaproj"),
                 ("Excel файлы (*.xlsx *.xls)", "*.xlsx *.xls"),
-                ("Проекты Excel Analyzer (*.eaproj)", "*.eaproj"),
+                ("Проекты NexGrid (*.eaproj)", "*.eaproj"),
                 ("Все файлы (*)", "*"),
             ],
             start_dir=last_dir,

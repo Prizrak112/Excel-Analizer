@@ -32,11 +32,20 @@ class ReportBlock:
             config=config or {},
         )
 
-    # ---------- Размеры ----------
+    # ---------- Размеры и Позиция в пространстве ----------
 
     def get_width(self) -> int:
-        """Ширина блока в % (25 / 33 / 50 / 66 / 75 / 100)."""
-        return int(self.config.get("width", 100))
+        """Ширина блока в % (от 15 до 100)."""
+        return max(15, min(100, int(self.config.get("width", 100))))
+
+    def get_align(self) -> str:
+        """Выравнивание блока на странице: 'left' | 'center' | 'right' | 'custom'."""
+        return str(self.config.get("align", "left"))
+
+    def get_offset_x(self) -> int:
+        """Горизонтальное смещение слева в % (0 .. 100 - width)."""
+        w = self.get_width()
+        return max(0, min(100 - w, int(self.config.get("offset_x", 0))))
 
     def get_margin_top(self) -> int:
         return int(self.config.get("margin_top", 0))
@@ -124,10 +133,6 @@ class Report:
     # ---------- Поиск ----------
     
     def find_block(self, block_id: str) -> tuple[Section, ReportBlock] | None:
-        """
-        Найти блок во всём отчёте (включая вложенные в контейнеры).
-        Возвращает (раздел, блок).
-        """
         for section in self.sections:
             found = _find_block_recursive(section.blocks, block_id)
             if found is not None:
@@ -135,10 +140,6 @@ class Report:
         return None
     
     def find_block_parent(self, block_id: str) -> tuple[Section, list[ReportBlock], ReportBlock] | None:
-        """
-        Найти блок И его родительский список (для вложенных — children контейнера).
-        Возвращает (section, parent_list, block).
-        """
         for section in self.sections:
             result = _find_block_parent_recursive(section.blocks, block_id, section)
             if result is not None:
@@ -148,7 +149,6 @@ class Report:
     # ---------- Перемещение ----------
 
     def move_block_across(self, block_id: str, target_section_id: str, new_index: int) -> bool:
-        """Переместить блок в другой раздел (или в тот же)."""
         src = self.find_block_parent(block_id)
         if src is None:
             return False
@@ -158,23 +158,29 @@ class Report:
         if target_section is None:
             return False
 
-        # Убираем из старого списка
         src_list.remove(block)
 
-        # Вставляем в новый (только на верхнем уровне раздела)
         new_index = max(0, min(new_index, len(target_section.blocks)))
         target_section.blocks.insert(new_index, block)
         return True
 
     # ---------- Слияние ----------
 
+    def unmerge_container(self, container_id: str) -> bool:
+        found = self.find_block_parent(container_id)
+        if not found:
+            return False
+        section, parent_list, container = found
+
+        if container.type != "container":
+            return False
+
+        children = container.config.get("children", [])
+        idx = parent_list.index(container)
+        parent_list[idx:idx + 1] = children
+        return True
+
     def merge_blocks(self, source_id: str, target_id: str, layout: str = "row") -> bool:
-        """
-        Слить два блока в контейнер.
-        source_id — блок, который тащат.
-        target_id — блок, на который упало.
-        Результат: контейнер с [target, source] вместо target.
-        """
         if source_id == target_id:
             return False
 
@@ -186,24 +192,29 @@ class Report:
         src_section, src_list, src_block = src
         tgt_section, tgt_list, tgt_block = tgt
 
-        # Нельзя сливать блок в его же потомка
         if _contains_block(src_block, target_id):
             return False
 
-        # Создаём контейнер
+        # Если целевой блок уже является контейнером — просто добавляем новый элемент внутрь него!
+        if tgt_block.type == "container":
+            children = list(tgt_block.config.get("children", []))
+            children.append(src_block)
+            tgt_block.config["children"] = children
+            src_list.remove(src_block)
+            return True
+
         container = ReportBlock.create("container", {
             "layout": layout,
             "gap": 14,
+            "width": 100,
+            "align": "left",
+            "offset_x": 0,
             "children": [tgt_block, src_block],
         })
 
-        # Заменяем target на container в его списке
         tgt_idx = tgt_list.index(tgt_block)
         tgt_list[tgt_idx] = container
-
-        # Удаляем source из его списка
         src_list.remove(src_block)
-
         return True
 
     # ---------- Статистика ----------
@@ -228,7 +239,6 @@ def _generate_id() -> str:
 
 
 def _find_block_recursive(blocks: list, block_id: str) -> ReportBlock | None:
-    """Ищет блок в списке, включая children контейнеров."""
     for b in blocks:
         if b.id == block_id:
             return b
@@ -240,7 +250,6 @@ def _find_block_recursive(blocks: list, block_id: str) -> ReportBlock | None:
 
 
 def _find_block_parent_recursive(blocks: list, block_id: str, section) -> tuple | None:
-    """Ищет блок и его родительский список."""
     for b in blocks:
         if b.id == block_id:
             return (section, blocks, b)
@@ -254,7 +263,6 @@ def _find_block_parent_recursive(blocks: list, block_id: str, section) -> tuple 
 
 
 def _contains_block(container_block: ReportBlock, block_id: str) -> bool:
-    """Проверяет, содержит ли container_block блок с данным id (рекурсивно)."""
     if container_block.type != "container":
         return False
     for child in container_block.config.get("children", []):
@@ -266,7 +274,6 @@ def _contains_block(container_block: ReportBlock, block_id: str) -> bool:
 
 
 def _count_blocks(blocks: list) -> int:
-    """Считает блоки рекурсивно (включая детей контейнеров)."""
     total = 0
     for b in blocks:
         total += 1

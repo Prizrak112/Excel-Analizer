@@ -11,14 +11,12 @@ class Renderer:
 
     def __init__(self):
         self.blocks: list[Block] = []
-        self.raw_items: list[str] = []   # для raw-строк (flexbox-row)
+        self.raw_items: list[str] = []
 
     def add(self, block: Block):
-        """Добавить блок."""
         self.blocks.append(block)
 
     def add_raw(self, html: str):
-        """Добавить готовый HTML без обёртки блока."""
         self.raw_items.append(html)
 
     def clear(self):
@@ -26,7 +24,6 @@ class Renderer:
         self.raw_items.clear()
 
     def render(self) -> str:
-        """Рендерит все блоки в HTML. Сначала все блоки, потом raw-вставки."""
         html_parts = []
         for block in self.blocks:
             try:
@@ -50,7 +47,6 @@ class Renderer:
 
 
 def render_blocks(blocks: list[Block]) -> str:
-    """Утилита: рендерит список блоков."""
     r = Renderer()
     for b in blocks:
         r.add(b)
