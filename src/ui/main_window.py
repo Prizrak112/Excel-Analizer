@@ -19,6 +19,7 @@ from PySide6.QtCore import Qt, QSize, QFileInfo, QTimer
 from PySide6.QtGui import QAction, QShortcut, QKeySequence, QIcon, QPixmap, QPainter, QColor, QFont
 import ctypes
 
+from PySide6.QtGui import QIcon
 from src.ui.constructor_tab import ConstructorTab
 from src.config.theme import get_theme, set_theme, toggle_theme
 from src.config.app_info import APP_WINDOW_TITLE
@@ -37,7 +38,7 @@ from src.ui.project_password_dialog import (
 )
 from src.ui.project_file_dialog import ProjectFileDialog
 from src.ui.folder_dialog import FolderOpenDialog
-# from src.ui.pivot_dialog import PivotDialog
+from src.ui.pivot_dialog import PivotDialog
 from src.ui.start_page import StartPage
 from src.ui.drop_dialog import DropDuplicatesDialog, DropNaDialog
 from src.ui.normalize_text_dialog import NormalizeTextDialog
@@ -183,6 +184,161 @@ def _list_qss(theme) -> str:
     """
 
 
+class _AnimatedLogoWidget(QWidget):
+    """
+    Анимированный логотип ⬡ NEXGRID.
+    Автоматически проигрывает анимацию (вращение гексагона + световой блик по буквам)
+    ровно 1 раз в минуту (60 000 мс), а также при клике мышью по логотипу.
+    """
+
+    def __init__(self, theme, parent=None):
+        super().__init__(parent)
+        self.theme = theme
+        self.setFixedSize(188, 42)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("NexGrid BI — нажмите для запуска анимации")
+
+        self._progress = 0.0
+        self._animating = False
+
+        # Таймер кадров самой анимации (~60 FPS, длительность ~1.6 сек)
+        self._frame_timer = QTimer(self)
+        self._frame_timer.setInterval(16)
+        self._frame_timer.timeout.connect(self._on_frame)
+
+        # Таймер запуска раз в минуту (60 000 мс)
+        self._minute_timer = QTimer(self)
+        self._minute_timer.setInterval(60_000)
+        self._minute_timer.timeout.connect(self.play_animation)
+        self._minute_timer.start()
+
+        self.setWindowIcon(QIcon("logo.ico"))
+        
+        # Первый приветственный прогон через 1.5 сек после открытия окна
+        QTimer.singleShot(1500, self.play_animation)
+
+    def play_animation(self):
+        if not self.isVisible():
+            return
+        self._progress = 0.0
+        self._animating = True
+        if not self._frame_timer.isActive():
+            self._frame_timer.start()
+
+    def _on_frame(self):
+        self._progress += 0.022
+        if self._progress >= 1.0:
+            self._progress = 0.0
+            self._animating = False
+            self._frame_timer.stop()
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.play_animation()
+        super().mousePressEvent(event)
+
+    def paintEvent(self, _event):
+        import math
+        from PySide6.QtCore import QPointF, QRectF
+        from PySide6.QtGui import QPolygonF, QPen, QLinearGradient
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+
+        primary_c = QColor(self.theme.primary)
+        text_c = QColor(self.theme.text_main)
+
+        t = self._progress if self._animating else 0.0
+        # Плавное ускорение и торможение (ease-in-out)
+        ease = 0.5 - 0.5 * math.cos(math.pi * t) if self._animating else 0.0
+        pulse = math.sin(math.pi * t) if self._animating else 0.0
+
+        # 1. Рисуем векторный гексагон ⬡ с вращением и неоновым свечением
+        cx, cy = 20.0, 21.0
+        base_r = 12.5 + 2.0 * pulse
+        angle_offset = ease * 2.0 * math.pi  # Полный оборот 360°
+
+        painter.save()
+        painter.translate(cx, cy)
+        painter.rotate(math.degrees(angle_offset))
+
+        if self._animating and pulse > 0.05:
+            glow_c = QColor(primary_c)
+            glow_c.setAlpha(int(95 * pulse))
+            painter.setPen(QPen(glow_c, 6.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.setBrush(Qt.NoBrush)
+            glow_poly = QPolygonF([
+                QPointF(base_r * math.cos(math.radians(60 * i - 30)),
+                        base_r * math.sin(math.radians(60 * i - 30)))
+                for i in range(6)
+            ])
+            painter.drawPolygon(glow_poly)
+
+        hex_poly = QPolygonF([
+            QPointF(base_r * math.cos(math.radians(60 * i - 30)),
+                    base_r * math.sin(math.radians(60 * i - 30)))
+            for i in range(6)
+        ])
+        pen_hex = QPen(primary_c, 2.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen_hex)
+        fill_c = QColor(primary_c)
+        fill_c.setAlpha(int(45 * pulse) if self._animating else 0)
+        painter.setBrush(fill_c)
+        painter.drawPolygon(hex_poly)
+
+        # Внутреннее ядро гексагона, проявляющееся в пике анимации
+        if self._animating and pulse > 0.1:
+            inner_r = base_r * 0.45 * pulse
+            inner_poly = QPolygonF([
+                QPointF(inner_r * math.cos(math.radians(60 * i - 30)),
+                        inner_r * math.sin(math.radians(60 * i - 30)))
+                for i in range(6)
+            ])
+            painter.setPen(Qt.NoPen)
+            core_c = QColor("#ffffff" if self.theme.is_dark else primary_c)
+            core_c.setAlpha(int(200 * pulse))
+            painter.setBrush(core_c)
+            painter.drawPolygon(inner_poly)
+
+        painter.restore()
+
+        # 2. Рисуем надпись NEXGRID со световым бликом во время анимации
+        font_bold = QFont("Century Gothic", 15, QFont.Bold)
+        font_Bold_letter_spacing = 3.5
+        font_bold.setLetterSpacing(QFont.AbsoluteSpacing, font_Bold_letter_spacing)
+
+        font_reg = QFont("Century Gothic", 15, QFont.Normal)
+        font_reg.setLetterSpacing(QFont.AbsoluteSpacing, font_Bold_letter_spacing)
+
+        x_text = 42.0
+        y_rect = QRectF(x_text, 0, 145, self.height())
+
+        if self._animating:
+            # Градиентный световой блик, пробегающий слева направо по буквам
+            shimmer_x = x_text - 20.0 + ease * 165.0
+            grad = QLinearGradient(shimmer_x - 28.0, 0, shimmer_x + 28.0, 0)
+            grad.setColorAt(0.0, text_c)
+            grad.setColorAt(0.5, primary_c.lighter(135))
+            grad.setColorAt(1.0, text_c)
+            text_pen = QPen(grad, 1)
+        else:
+            text_pen = QPen(text_c)
+
+        painter.setPen(text_pen)
+        painter.setFont(font_bold)
+        painter.drawText(y_rect, Qt.AlignVCenter | Qt.AlignLeft, "NEX")
+
+        fm_bold = painter.fontMetrics()
+        nex_w = fm_bold.horizontalAdvance("NEX")
+
+        painter.setFont(font_reg)
+        grid_rect = QRectF(x_text + nex_w, 0, 100, self.height())
+        painter.drawText(grid_rect, Qt.AlignVCenter | Qt.AlignLeft, "GRID")
+        painter.end()
+
+
 class MainWindow(QMainWindow):
     """Главное окно приложения."""
     def _create_app_icon(self) -> QIcon:
@@ -225,12 +381,13 @@ class MainWindow(QMainWindow):
         self._displayed_indices: list[int] = []
         self._sort_state: list[tuple[str, bool]] = []
         self._find_dialog = None
-        self.report = Report()
-        self.history = HistoryManager(max_size=50)
         self.file_manager = FileManager()
+        self.report = Report(file_manager=self.file_manager)
+        self.history = HistoryManager(max_size=50)
 
         self.setWindowTitle(APP_WINDOW_TITLE)
-        self.resize(1400, 900)
+        self.setMinimumSize(960, 600)
+        self._apply_adaptive_window_size()
 
         self._build_menu()
         self._build_ui()
@@ -245,6 +402,23 @@ class MainWindow(QMainWindow):
     # ============================================================
     # Меню
     # ============================================================
+    def _apply_adaptive_window_size(self):
+        """Подбирает размер окна под реальную рабочую область экрана (от 13" ноутбука до большого монитора)."""
+        from PySide6.QtGui import QGuiApplication
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            w = max(980, min(1480, int(avail.width() * 0.90)))
+            h = max(620, min(920, int(avail.height() * 0.88)))
+            self.resize(w, h)
+            self.move(
+                avail.x() + max(0, (avail.width() - w) // 2),
+                avail.y() + max(0, (avail.height() - h) // 2),
+            )
+            if avail.width() <= 1366 or avail.height() <= 768:
+                self.setWindowState(Qt.WindowMaximized)
+        else:
+            self.resize(1280, 760)
 
     def _build_menu(self):
         self.custom_menubar = QMenuBar()
@@ -466,35 +640,9 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(20, 0, 20, 0)
         lay.setSpacing(16)
 
-        # 1. Логотип / Название (разделен на 2 виджета для идеального выравнивания)
-        logo_container = QWidget()
-        logo_container.setStyleSheet("background: transparent; border: none;")
-        logo_lay = QHBoxLayout(logo_container)
-        logo_lay.setContentsMargins(0, 0, 0, 0)
-        logo_lay.setSpacing(6)  # <-- Жёстко контролируемый отступ (6px)
-
-        icon_label = QLabel("⬡")
-        icon_label.setStyleSheet(f"""
-            color: {self.theme.primary};
-            font-size: 34px;
-            font-weight: normal;
-            margin-bottom: 4px; /* Визуальная компенсация глифа для центрирования */
-        """)
-        icon_label.setAlignment(Qt.AlignVCenter)
-
-        text_label = QLabel("<b>NEX</b>GRID")
-        text_label.setStyleSheet(f"""
-            color: {self.theme.text_main};
-            font-family: "Century Gothic", "Tw Cen MT", "Segoe UI", sans-serif;
-            font-size: 21px;
-            letter-spacing: 4px;
-        """)
-        text_label.setAlignment(Qt.AlignVCenter)
-
-        logo_lay.addWidget(icon_label)
-        logo_lay.addWidget(text_label)
-
-        lay.addWidget(logo_container)
+        # 1. Анимированный логотип (проигрывается раз в минуту и по клику)
+        self.logo_widget = _AnimatedLogoWidget(self.theme, bar)
+        lay.addWidget(self.logo_widget)
 
         # 2. Интегрированное меню
         if hasattr(self, 'custom_menubar'):
@@ -853,10 +1001,11 @@ class MainWindow(QMainWindow):
     def _build_left_panel(self) -> QWidget:
         widget = QWidget()
         widget.setStyleSheet(f"background: {self.theme.bg_page};")
-        widget.setMinimumWidth(70)
+        widget.setMinimumWidth(245)
+        widget.setMaximumWidth(380)
 
         outer = QVBoxLayout(widget)
-        outer.setContentsMargins(0, 16, 0, 16)
+        outer.setContentsMargins(0, 12, 0, 12)
         outer.setSpacing(0)
 
         # ═══ ШАПКА ═══
@@ -1006,11 +1155,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(sep)
         layout.addSpacing(12)
 
-        # ── Колонки ──
-        cols_header = QHBoxLayout()
-        cols_header.setContentsMargins(0, 0, 0, 0)
-        cols_header.setSpacing(4)
-
+        # ── Колонки (адаптивная шапка в 2 ряда без обрезания кнопок) ──
+        cols_title_row = QHBoxLayout()
+        cols_title_row.setContentsMargins(0, 0, 0, 0)
         label_cols = QLabel("📊  КОЛОНКИ")
         label_cols.setStyleSheet(f"""
             color: {self.theme.text_muted};
@@ -1019,31 +1166,34 @@ class MainWindow(QMainWindow):
             letter-spacing: 1.2px;
             background: transparent;
         """)
-        cols_header.addWidget(label_cols)
-        cols_header.addStretch()
+        cols_title_row.addWidget(label_cols)
+        cols_title_row.addStretch()
+        layout.addLayout(cols_title_row)
+        layout.addSpacing(6)
+
+        cols_btns_row = QHBoxLayout()
+        cols_btns_row.setContentsMargins(0, 0, 0, 0)
+        cols_btns_row.setSpacing(6)
 
         self.btn_edit = QPushButton("Изменить")
-        self.btn_edit.setMinimumWidth(90)
         self.btn_edit.setCursor(Qt.PointingHandCursor)
         self.btn_edit.setStyleSheet(_pill_btn_qss(self.theme, active=False))
         self.btn_edit.clicked.connect(self._toggle_edit_mode)
-        cols_header.addWidget(self.btn_edit)
+        cols_btns_row.addWidget(self.btn_edit, 2)
 
         btn_show_all = QPushButton("Все")
-        btn_show_all.setMinimumWidth(60)
         btn_show_all.setCursor(Qt.PointingHandCursor)
         btn_show_all.setStyleSheet(_pill_btn_qss(self.theme, active=True))
         btn_show_all.clicked.connect(self._show_all_columns)
-        cols_header.addWidget(btn_show_all)
+        cols_btns_row.addWidget(btn_show_all, 1)
 
         btn_reset = QPushButton("Сброс")
-        btn_reset.setMinimumWidth(70)
         btn_reset.setCursor(Qt.PointingHandCursor)
         btn_reset.setStyleSheet(_pill_btn_qss(self.theme, active=False))
         btn_reset.clicked.connect(self._hide_all_columns)
-        cols_header.addWidget(btn_reset)
+        cols_btns_row.addWidget(btn_reset, 1)
 
-        layout.addLayout(cols_header)
+        layout.addLayout(cols_btns_row)
         layout.addSpacing(6)
 
         self.cols_stack = QStackedWidget()
@@ -1112,8 +1262,6 @@ class MainWindow(QMainWindow):
         self.data_viewer.sheet_switch_requested.connect(self._on_sheet_switch)
         self.data_viewer.pivot_edit_requested.connect(self._on_pivot_edit)
         self.data_viewer.sheet_rename_requested.connect(self._on_sheet_rename)
-        self.editor_tabs.addTab(self.data_viewer, "📋   Данные")
-
         self.editor_tabs.addTab(self.data_viewer, "📋  Таблица")
         self.code_editor = CodeEditorWidget(self.theme)
         self.code_editor.btn_refresh.clicked.connect(self._refresh_code)
@@ -1183,8 +1331,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.center_panel, stretch=1)
 
         self.right_content = QStackedWidget()
-        self.right_content.setMinimumWidth(320)
-        self.right_content.setMaximumWidth(360)
+        self.right_content.setMinimumWidth(270)
+        self.right_content.setMaximumWidth(340)
         self.right_content.setStyleSheet(f"background: {self.theme.bg_page};")
 
         self.inspector = InspectorPanel(self.theme)
@@ -1201,6 +1349,7 @@ class MainWindow(QMainWindow):
         self.data_panel.drop_na_requested.connect(self._on_drop_na)
         self.data_panel.normalize_text_requested.connect(self._on_normalize_text)
         self.data_panel.extract_text_requested.connect(self._on_extract_text)
+        self.data_panel.merge_headers_requested.connect(self._on_merge_headers) # <--- НОВОЕ
         self.right_content.addWidget(self._wrap_with_title(self.data_panel, "📊  ДАННЫЕ"))
 
         links_stub = QLabel("🔗  Раздел «Связи»\n\nБудет здесь позже.")
@@ -1361,6 +1510,10 @@ class MainWindow(QMainWindow):
         self.files_list.blockSignals(False)
         self._refresh_left_empty_states()
         self._update_files_buttons()
+
+        self.report.file_manager = self.file_manager
+        if hasattr(self, "constructor") and self.constructor is not None:
+            self.constructor.inspector.file_manager = self.file_manager
 
     def _update_files_buttons(self):
         if not hasattr(self, 'btn_delete_files'):
@@ -1827,69 +1980,85 @@ class MainWindow(QMainWindow):
             self._refresh_code()
 
     def _toggle_left_panel(self):
-        """Свернуть / развернуть левую панель."""
+        """Свернуть / развернуть левую панель без наползания кнопок и текста."""
         if not hasattr(self, "main_splitter"):
             return
 
         self._left_panel_collapsed = not self._left_panel_collapsed
         sizes = self.main_splitter.sizes()
-        total = sizes[0] + sizes[1]
+        total = max(800, sum(sizes) or self.width())
 
         if self._left_panel_collapsed:
-            if sizes[0] > 90:
+            if sizes[0] >= 200:
                 self._left_panel_expanded_width = sizes[0]
 
-            self.left_content.setMaximumHeight(0)
+            self._left_panel.setMinimumWidth(48)
+            self._left_panel.setMaximumWidth(48)
+            self.left_content.hide()
             self.label_left_title.hide()
+            self.btn_add_file.hide()
             self.btn_toggle_left.setText(">>")
             self.btn_toggle_left.setToolTip("Развернуть панель")
-
-            self.main_splitter.setSizes([78, total - 78])
+            self.main_splitter.setSizes([48, max(400, total - 48)])
         else:
+            w = max(245, min(320, int(getattr(self, "_left_panel_expanded_width", 265) or 265)))
+            self._left_panel.setMinimumWidth(245)
+            self._left_panel.setMaximumWidth(380)
+            self.left_content.show()
             self.left_content.setMaximumHeight(16777215)
             self.label_left_title.show()
+            self.btn_add_file.show()
             self.btn_toggle_left.setText("<<")
             self.btn_toggle_left.setToolTip("Свернуть панель")
-
-            w = self._left_panel_expanded_width
-            self.main_splitter.setSizes([w, total - w])
+            self.main_splitter.setSizes([w, max(400, total - w)])
 
     def _apply_page_layout(self, index: int):
         """
-        Показываем/скрываем панели в зависимости от страницы.
+        Показываем/скрываем панели в зависимости от страницы и гарантируем
+        правильную ширину левой панели при переходе на вкладку «Данные».
         """
         is_editor = (index == 1)
         is_constructor = (index == 2)
         is_start = (index == 0)
 
-        # ── Полоса навигации (🏠 📊 🎨) — скрываем на Старте ──
         if hasattr(self, "top_nav"):
             self.top_nav.setVisible(not is_start)
 
-        # ── Менюбар целиком скрываем на Старте ──
         if hasattr(self, "custom_menubar"):
             self.custom_menubar.setVisible(not is_start)
 
-        # ── Меню «Отчёт» убрано — проверяем на None для совместимости ──
         if getattr(self, "report_menu", None) is not None:
             self.report_menu.setVisible(is_constructor)
 
-        # ── Тулбар — только на Редакторе ──
-        # Тулбар действий — только на Редакторе
         if hasattr(self, "top_toolbar") and self.top_toolbar is not None:
             self.top_toolbar.setVisible(is_editor)
 
-        # ── Левая панель — только на Редакторе ──
         if hasattr(self, "main_splitter"):
             left = self.main_splitter.widget(0)
             if left is not None:
                 left.setVisible(is_editor)
+                if is_editor:
+                    total_w = max(900, self.width())
+                    if getattr(self, "_left_panel_collapsed", False):
+                        left.setMinimumWidth(48)
+                        left.setMaximumWidth(48)
+                        self.left_content.hide()
+                        self.label_left_title.hide()
+                        self.btn_add_file.hide()
+                        self.main_splitter.setSizes([48, total_w - 48])
+                    else:
+                        target_left_w = max(245, min(300, int(total_w * 0.21)))
+                        left.setMinimumWidth(245)
+                        left.setMaximumWidth(380)
+                        self.left_content.show()
+                        self.left_content.setMaximumHeight(16777215)
+                        self.label_left_title.show()
+                        self.btn_add_file.show()
+                        self.main_splitter.setSizes([target_left_w, total_w - target_left_w])
 
-        # ── Rail — только на Редакторе ──
         if hasattr(self, "rail"):
             self.rail.setVisible(is_editor)
 
-        # ── Правая панель — только на Редакторе ──
         if hasattr(self, "right_content"):
             if is_editor and self._content_visible:
                 self.right_content.show()
@@ -2004,6 +2173,7 @@ class MainWindow(QMainWindow):
             "active_tab": getattr(self, "_current_page", 0),
             "theme": "dark" if self.theme.is_dark else "light",
             "tabs_format": 2,
+            "report": self.report.to_dict() if hasattr(self.report, "to_dict") else None,
         }
 
         ok, msg = ProjectIO.save(
@@ -2139,6 +2309,15 @@ class MainWindow(QMainWindow):
         if self.current_data is not None:
             self._update_columns_tree(self.current_data)
             self._update_data_viewer(self.current_data)
+
+        # Восстанавливаем макет Конструктора и все настройки блоков из проекта
+        self.report.file_manager = self.file_manager
+        report_state = extra.get("report")
+        if report_state and hasattr(self.report, "load_from_dict"):
+            self.report.load_from_dict(report_state)
+        if hasattr(self, "constructor") and self.constructor is not None:
+            self.constructor.inspector.file_manager = self.file_manager
+            self.constructor._refresh_all()
 
         self._update_undo_buttons()
         self._refresh_files_list()
@@ -2508,12 +2687,7 @@ class MainWindow(QMainWindow):
 
     def _open_excel_by_path(self, filepath: str):
         try:
-            for entry in self.file_manager.get_all():
-                if entry.data.source_path == filepath:
-                    self._switch_to_file(entry.id)
-                    ToastManager.info("Файл уже открыт", f"«{entry.display_name}»", self.theme)
-                    return
-
+            # Сначала проверяем, сколько листов у файла, чтобы пользователь мог выбрать нужный
             lower = filepath.lower()
             if not lower.endswith((".xlsx", ".xls")):
                 QMessageBox.warning(
@@ -2535,6 +2709,15 @@ class MainWindow(QMainWindow):
                 sheet_name = sheet
             else:
                 sheet_name = sheets[0] if sheets else 0
+
+            # Проверяем, не открыт ли уже ЭТОТ ЖЕ САМЫЙ ЛИСТ этого файла
+            target_sheet_str = str(sheet_name) if sheet_name is not None else "Sheet1"
+            for entry in self.file_manager.get_all():
+                ent_sheet = entry.data.sheet_name or "Sheet1"
+                if entry.data.source_path == filepath and ent_sheet == target_sheet_str:
+                    self._switch_to_file(entry.id)
+                    ToastManager.info("Этот лист уже открыт", f"«{entry.display_name}»", self.theme)
+                    return
 
             data = DataLoader.load(filepath, sheet_name)
             file_id = self.file_manager.add_file(data)
@@ -2789,21 +2972,64 @@ class MainWindow(QMainWindow):
     def _on_filter_requested(self, col_name: str, global_pos):
         if self.current_data is None:
             return
-        import pandas as pd
+        
+        # Если передано отображаемое имя колонки вместо реального
+        if col_name not in self.current_data.dataframe.columns:
+            for real_c in self.current_data.dataframe.columns:
+                if self.current_data.get_display_name(real_c) == col_name:
+                    col_name = real_c
+                    break
+            else:
+                return
+
         series = self.current_data.dataframe[col_name]
-        unique_raw = series.unique()
-        na_mask = pd.isna(unique_raw)
-        has_na = bool(na_mask.any())
-        if has_na:
-            unique_raw = unique_raw[~na_mask]
-        unique_strs = sorted({str(v) for v in unique_raw})
+        unique_strs_set = set()
+        has_na = False
+
+        for v in series.unique():
+            if pd.isna(v):
+                has_na = True
+            else:
+                s = str(v).strip()
+                if s in ("", "—", "nan", "None", "<NA>"):
+                    has_na = True
+                else:
+                    unique_strs_set.add(str(v))
+
+        unique_strs = sorted(unique_strs_set)
         if has_na:
             unique_strs.append("—")
+
         current_filter = self.current_data.column_filters.get(col_name)
-        popup = FilterPopup(self.theme, col_name, unique_strs, current_filter, self)
-        popup.applied.connect(self._on_filter_applied)
-        popup.move(global_pos)
-        popup.show()
+
+        # Закрываем старый попап, если он был открыт
+        if getattr(self, "_filter_popup", None) is not None:
+            try:
+                self._filter_popup.close()
+            except Exception:
+                pass
+
+        # Обязательно сохраняем ссылку в self._filter_popup!
+        self._filter_popup = FilterPopup(
+            self.theme, col_name, unique_strs, current_filter, self
+        )
+        self._filter_popup.applied.connect(self._on_filter_applied)
+        self._filter_popup.sort_requested.connect(self._on_filter_sort_requested)
+        self._filter_popup.move(global_pos)
+        self._filter_popup.show()
+
+    def _on_filter_sort_requested(self, col_name: str, ascending: bool):
+        if self.current_data is None:
+            return
+        self._sort_state = [(col_name, ascending)]
+        from src.core.commands import SortByColumnCommand
+        cmd = SortByColumnCommand(
+            data=self.current_data,
+            sort_spec=self._sort_state,
+            on_change=self._on_sort_applied,
+        )
+        self.history.execute(cmd)
+        self._update_undo_buttons()
 
     def _on_filter_applied(self, col_name: str, allowed: list):
         if self.current_data is None:
@@ -3155,6 +3381,36 @@ class MainWindow(QMainWindow):
     # ============================================================
     # Дубликаты и пустые
     # ============================================================
+    def _on_merge_headers(self):
+            if self.current_data is None:
+                ToastManager.info("Нет данных", "Сначала загрузите файл", self.theme)
+                return
+                
+            from src.core.commands import MergeHeadersCommand
+            
+            reply = QMessageBox.question(
+                self, "Склеить двухуровневую шапку",
+                "Программа возьмет текущие заголовки (включая Unnamed), "
+                "склеит их с первой строкой таблицы и сделает это новой шапкой.\n\n"
+                "Действие можно отменить (Ctrl+Z). Выполнить?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+                
+            cmd = MergeHeadersCommand(
+                data=self.current_data,
+                on_change=self._on_columns_changed,
+            )
+            self.history.execute(cmd)
+
+            if getattr(cmd, "_ok", False):
+                ToastManager.success("Готово", cmd._message, self.theme)
+                self.statusBar().showMessage(f"🛠 {cmd._message}")
+            else:
+                ToastManager.error("Ошибка", getattr(cmd, "_message", "Неизвестная ошибка"), self.theme)
+
+            self._update_undo_buttons()
 
     def _on_drop_duplicates(self):
         if self.current_data is None:

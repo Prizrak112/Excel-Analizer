@@ -3,7 +3,7 @@
 from PySide6.QtWidgets import (
     QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QApplication,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QPainter, QColor, QPen
 
 from src.ui.block_widgets import make_block_widget, BlockWidget
@@ -173,6 +173,7 @@ class Canvas(QScrollArea):
             rlay.setContentsMargins(left_px, top_m, 0, max(0, bot_m - 14))
 
     def rebuild(self, report, dataframe=None):
+        self._report_ref = report
         while self._layout.count():
             item = self._layout.takeAt(0)
             w = item.widget()
@@ -228,8 +229,12 @@ class Canvas(QScrollArea):
         row_lay.setSpacing(0)
         row_lay.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
+        block_df = dataframe
+        if hasattr(self, "_report_ref") and self._report_ref is not None and hasattr(self._report_ref, "get_block_dataframe"):
+            block_df = self._report_ref.get_block_dataframe(spec.config, fallback_df=dataframe)
+
         w = make_block_widget(
-            spec.type, spec.id, spec.config, dataframe, row_wrap, self.theme,
+            spec.type, spec.id, spec.config, block_df, row_wrap, self.theme,
         )
         w.clicked.connect(self._on_block_widget_clicked)
         w.live_resized.connect(self._on_block_live_resized)
@@ -455,7 +460,10 @@ class Canvas(QScrollArea):
                     current_section_id = sec_id
 
         if current_section_id is None:
-            current_section_id = section_widgets[0][0]
+            if section_widgets:
+                current_section_id = section_widgets[0][0]
+            else:
+                return None
 
         blocks_in_section = []
         for wid, w in self._widgets.items():

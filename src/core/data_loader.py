@@ -181,13 +181,45 @@ class LoadedData:
         return True
 
     def get_sheets_for_save(self) -> list[tuple[str, pd.DataFrame]]:
-        """Список (имя_листа, DataFrame) для сохранения в XLSX."""
+        """Список (имя_листа, DataFrame) для сохранения в XLSX с учётом переименованных столбцов."""
         result = []
         current = self.sheet_name or "Sheet1"
-        result.append((current, self.dataframe))
+
+        # 1. Активный лист: применяем порядок и пользовательские названия столбцов
+        cur_df = self.dataframe.copy()
+        ordered_cols = [c for c in self.column_order if c in cur_df.columns]
+        for c in cur_df.columns:
+            if c not in ordered_cols:
+                ordered_cols.append(c)
+        if ordered_cols:
+            cur_df = cur_df[ordered_cols]
+        rename_map = {c: self.get_display_name(c) for c in cur_df.columns if self.get_display_name(c) != c}
+        if rename_map:
+            cur_df = cur_df.rename(columns=rename_map)
+        result.append((current, cur_df))
+
+        # 2. Дополнительные листы: применяем сохранённые метаданные из sheet_states
         for n, df in self.extra_sheets.items():
             if n != current:
-                result.append((n, df))
+                ext_df = df.copy()
+                saved_state = self.sheet_states.get(n, {})
+                saved_order = saved_state.get("column_order", [])
+                saved_meta = saved_state.get("column_meta", {})
+                if saved_order:
+                    ext_cols = [c for c in saved_order if c in ext_df.columns]
+                    for c in ext_df.columns:
+                        if c not in ext_cols:
+                            ext_cols.append(c)
+                    ext_df = ext_df[ext_cols]
+                if saved_meta:
+                    ext_rename = {
+                        c: saved_meta[c].get("display_name", c)
+                        for c in ext_df.columns
+                        if c in saved_meta and saved_meta[c].get("display_name")
+                    }
+                    if ext_rename:
+                        ext_df = ext_df.rename(columns=ext_rename)
+                result.append((n, ext_df))
         return result
 
     # ============================================================
@@ -246,7 +278,10 @@ class LoadedData:
                 return True, "Преобразовано в строку"
 
             elif new_dtype in ("datetime", "datetime64[ns]"):
-                converted = pd.to_datetime(series, errors="coerce")
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    converted = pd.to_datetime(series, errors="coerce")
                 if converted.isna().all():
                     return False, "Не удалось преобразовать в дату"
                 self.dataframe[column] = converted
@@ -319,10 +354,13 @@ class LoadedData:
 
             if delete_original:
                 self.dataframe = self.dataframe.drop(columns=[column])
-                del self.dtypes[column]
-                self.columns.remove(column)
-                self.column_order.remove(column)
-                self.visible_columns.remove(column)
+                self.dtypes.pop(column, None)
+                if column in self.columns:
+                    self.columns.remove(column)
+                if column in self.column_order:
+                    self.column_order.remove(column)
+                if column in self.visible_columns:
+                    self.visible_columns.remove(column)
                 self.reset_column_meta(column)
                 orig_index = min(orig_index, len(self.columns))
 
@@ -587,6 +625,7 @@ class LoadedData:
         return bool(self.column_filters)
 
     def get_filtered_indices(self) -> list:
+        import numpy as np
         n = len(self.dataframe)
         if not self.column_filters:
             return list(range(n))
@@ -597,15 +636,19 @@ class LoadedData:
         for col, allowed in self.column_filters.items():
             if col not in df.columns:
                 continue
-            allowed_strs = set(str(v) for v in allowed)
+            allowed_strs = {str(v).strip() for v in allowed}
             include_na = "—" in allowed_strs
 
             series = df[col]
-            str_series = series.astype(str)
+            str_series = series.astype(str).str.strip()
 
             col_mask = str_series.isin(allowed_strs).to_numpy(dtype=bool, na_value=False)
             if include_na:
-                col_mask |= series.isna().to_numpy(dtype=bool, na_value=False)
+                na_mask = (
+                    series.isna().to_numpy(dtype=bool, na_value=False)
+                    | str_series.isin({"", "—", "nan", "None", "<NA>"}).to_numpy(dtype=bool, na_value=False)
+                )
+                col_mask |= na_mask
 
             mask &= col_mask
 
@@ -755,6 +798,15 @@ class DataLoader:
 
         if path.suffix.lower() not in cls.SUPPORTED_EXTENSIONS:
             raise ValueError(f"Неподдерживаемый формат: {path.suffix}")
+
+        # Проверка доступности файла для чтения (защита от блокировки Excel)
+        try:
+            with open(path, "rb"):
+                pass
+        except PermissionError:
+            raise PermissionError(f"Файл занят другой программой (например, Microsoft Excel): {path.name}")
+        except Exception:
+            pass
 
         # ★ Быстрый движок: python-calamine (Rust) — в 10-30 раз быстрее
         #   openpyxl на больших файлах (100k+ строк).

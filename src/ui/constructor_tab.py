@@ -24,17 +24,24 @@ from src.ui.rich_text_dialog import RichTextDialog, clean_qt_html
 from src.ui.rich_text_toolbar import RichTextToolbar
 
 
+_SHARED_PREVIEW_SERVER: PreviewServer | None = None
+
+
 class ConstructorTab(QWidget):
     """Вкладка «🎨 Конструктор» со своим меню."""
 
     def __init__(self, theme, report: Report, parent=None):
         super().__init__(parent)
+        global _SHARED_PREVIEW_SERVER
+        if _SHARED_PREVIEW_SERVER is None:
+            _SHARED_PREVIEW_SERVER = PreviewServer()
+
         self.theme = theme
         self.report = report
         self.current_data = None
         self._sel_block: str | None = None
         self._sel_section: str | None = None
-        self._preview = PreviewServer()
+        self._preview = _SHARED_PREVIEW_SERVER
 
         self._build_ui()
         BugReporter.register_context_provider(self._collect_bug_context)
@@ -200,14 +207,17 @@ class ConstructorTab(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._build_preview_bar())
-
-        self._splitter = QSplitter(Qt.Horizontal)
-        self._splitter.setHandleWidth(1)
-
+        # 1. Верхняя интерактивная панель групп добавления блоков (с задержкой 1 сек и живым превью)
         self.palette = BlocksPalette(self.theme, BLOCK_TYPES)
         self.palette.block_requested.connect(self._on_add_block)
-        self._splitter.addWidget(self.palette)
+        root.addWidget(self.palette)
+
+        # 2. Панель форматирования текста и рендера
+        root.addWidget(self._build_preview_bar())
+
+        # 3. Основная рабочая область: Структура отчёта | Холст | Инспектор
+        self._splitter = QSplitter(Qt.Horizontal)
+        self._splitter.setHandleWidth(1)
 
         self.layers = LayersTree(self.theme)
         self.layers.block_selected.connect(self._on_block_selected)
@@ -235,18 +245,25 @@ class ConstructorTab(QWidget):
         self._splitter.addWidget(self.canvas)
 
         self.inspector = BlockInspector(self.theme)
+        self.inspector.report_ref = self.report
+        self.inspector.file_manager = getattr(self.report, "file_manager", None)
         self.inspector.config_changed.connect(self._on_config_changed)
         self.inspector.unmerge_requested.connect(self._on_unmerge_requested)
         self._splitter.addWidget(self.inspector)
 
-        self._splitter.setSizes([200, 210, 720, 330])
+        self.layers.setMinimumWidth(165)
+        self.layers.setMaximumWidth(260)
+        self.canvas.setMinimumWidth(420)
+        self.inspector.setMinimumWidth(250)
+        self.inspector.setMaximumWidth(360)
+
+        self._splitter.setSizes([195, 760, 295])
         self._splitter.setStretchFactor(0, 0)
-        self._splitter.setStretchFactor(1, 0)
-        self._splitter.setStretchFactor(2, 1)
-        self._splitter.setStretchFactor(3, 0)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.setStretchFactor(2, 0)
         self._splitter.setCollapsible(0, True)
-        self._splitter.setCollapsible(1, True)
-        self._splitter.setCollapsible(3, True)
+        self._splitter.setCollapsible(1, False)
+        self._splitter.setCollapsible(2, True)
         root.addWidget(self._splitter, stretch=1)
 
         QShortcut(QKeySequence("Ctrl+P"), self, activated=self._on_preview)
@@ -278,6 +295,34 @@ class ConstructorTab(QWidget):
         b_bug.clicked.connect(self._on_manual_bug_report)
         lay.addWidget(b_bug)
 
+        self.btn_render = QPushButton("🔄  Обновить рендер")
+        self.btn_render.setCursor(Qt.PointingHandCursor)
+        self.btn_render.setToolTip("Применить все выбранные настройки, перестроить холст и обновить отчёт")
+        self.btn_render.setStyleSheet(_btn_qss(self.theme, primary=False))
+        self.btn_render.clicked.connect(self._on_manual_render)
+        lay.addWidget(self.btn_render)
+
+        # ── КНОПКА СБРОСА КЭША И ПЕРЕЗАГРУЗКИ ДАННЫХ ИЗ EXCEL (В КОНСТРУКТОРЕ И РЕДАКТОРЕ) ──
+        self.btn_refresh_data = QPushButton("🔄  Обновить данные")
+        self.btn_refresh_data.setCursor(Qt.PointingHandCursor)
+        self.btn_refresh_data.setToolTip("Сбросить кэш памяти и перечитать измененный Excel-файл с диска в Редактор и Отчёт")
+        self.btn_refresh_data.setStyleSheet("""
+            QPushButton {
+                background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0;
+                border-radius: 6px; padding: 6px 12px; font-weight: 600; font-size: 12px;
+            }
+            QPushButton:hover {
+                background: #dcfce7;
+                border: 1px solid #16a34a;
+            }
+        """)
+
+        self.btn_refresh_data.clicked.connect(self.reload_excel_data_everywhere)
+        lay.addWidget(self.btn_refresh_data)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(300, self._inject_refresh_btn_into_editor)
+        # ────────────────────────────────────────────────────────────────────────────────────
+
         b_prev = QPushButton("👁  Предпросмотр")
         b_prev.setCursor(Qt.PointingHandCursor)
         b_prev.setStyleSheet(_btn_qss(self.theme, primary=True))
@@ -285,6 +330,140 @@ class ConstructorTab(QWidget):
         lay.addWidget(b_prev)
 
         return bar
+
+    def _inject_refresh_btn_into_editor(self):
+        """Добавляет кнопку '🔄 Обновить данные из файла' напрямую в панель Редактора таблиц."""
+        try:
+            main_win = self.window()
+            if main_win is None or getattr(main_win, "_has_ea_refresh_btn", False):
+                return
+            # Ищем панель инструментов или шапку в Редакторе (data_panel / data_viewer / toolbar)
+            for attr_name in ("data_panel", "editor_tab", "data_viewer", "toolbar"):
+                panel = getattr(main_win, attr_name, None)
+                if panel is not None and isinstance(panel, QWidget) and panel.layout() is not None:
+                    btn_ed = QPushButton("🔄 Обновить данные из Excel")
+                    btn_ed.setCursor(Qt.PointingHandCursor)
+                    btn_ed.setToolTip("Перечитать сохраненный Excel-файл с диска в Редактор и Конструктор")
+                    btn_ed.setStyleSheet("""
+                        QPushButton {
+                            background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0;
+                            border-radius: 6px; padding: 5px 12px; font-weight: 600; font-size: 12px;
+                        }
+                        QPushButton:hover { background: #dcfce7; border: 1px solid #16a34a; }
+                    """)
+                    btn_ed.clicked.connect(self.reload_excel_data_everywhere)
+                    panel.layout().addWidget(btn_ed)
+                    main_win._has_ea_refresh_btn = True
+                    break
+            QShortcut(QKeySequence("F5"), main_win, activated=self.reload_excel_data_everywhere)
+        except Exception:
+            pass
+
+    def reload_excel_data_everywhere(self):
+        """Принудительно перечитывает Excel-файлы с диска через pandas и обновляет Редактор и Конструктор."""
+        import pandas as pd
+        from pathlib import Path
+
+        try:
+            from src.core.blocks import DataMemoryCache
+            DataMemoryCache.clear_all()
+        except Exception:
+            pass
+
+        reloaded_count = 0
+        fm = getattr(self.report, "file_manager", None) if hasattr(self, "report") else None
+
+        # 1. Перечитываем все файлы, зарегистрированные в FileManager
+        if fm is not None:
+            if hasattr(fm, "get_all"):
+                for entry in (fm.get_all() or []):
+                    data_obj = getattr(entry, "data", entry)
+                    fp = (
+                        getattr(entry, "filepath", None)
+                        or getattr(entry, "file_path", None)
+                        or getattr(entry, "path", None)
+                        or getattr(data_obj, "filepath", None)
+                        or getattr(data_obj, "file_path", None)
+                        or getattr(data_obj, "path", None)
+                    )
+                    sh = (
+                        getattr(entry, "sheet_name", None)
+                        or getattr(data_obj, "sheet_name", None)
+                        or 0
+                    )
+                    if fp and Path(str(fp)).is_file():
+                        try:
+                            fresh_df = pd.read_excel(str(fp), sheet_name=sh)
+                            if hasattr(data_obj, "dataframe"):
+                                data_obj.dataframe = fresh_df
+                            if hasattr(data_obj, "_df"):
+                                data_obj._df = fresh_df
+                            if hasattr(entry, "dataframe"):
+                                entry.dataframe = fresh_df
+                            reloaded_count += 1
+                        except Exception as e:
+                            print(f"[Reload] Ошибка чтения {fp} (лист {sh}): {e}")
+
+            # Очищаем внутренние кэши FileManager, если они есть
+            for cache_attr in ("_cache", "_df_cache", "_dataframes"):
+                if hasattr(fm, cache_attr) and isinstance(getattr(fm, cache_attr), dict):
+                    getattr(fm, cache_attr).clear()
+
+        # 2. Перечитываем активный датасет Редактора (self.current_data)
+        if self.current_data is not None:
+            fp_cur = (
+                getattr(self.current_data, "filepath", None)
+                or getattr(self.current_data, "file_path", None)
+                or getattr(self.current_data, "path", None)
+            )
+            sh_cur = getattr(self.current_data, "sheet_name", None) or 0
+            if fp_cur and Path(str(fp_cur)).is_file():
+                try:
+                    fresh_cur_df = pd.read_excel(str(fp_cur), sheet_name=sh_cur)
+                    self.current_data.dataframe = fresh_cur_df
+                    if hasattr(self.current_data, "_df"):
+                        self.current_data._df = fresh_cur_df
+                    reloaded_count += 1
+                except Exception as e:
+                    print(f"[Reload] Ошибка чтения текущего файла {fp_cur}: {e}")
+
+            self.set_data(self.current_data)
+
+            # 3. Обновляем таблицу в самом Редакторе (Главном окне)
+            main_win = self.window()
+            if main_win is not None:
+                for viewer_attr in ("data_viewer", "viewer", "table_view", "data_panel", "editor_tab"):
+                    v_widget = getattr(main_win, viewer_attr, None)
+                    if v_widget is not None:
+                        for method_name in ("set_data", "load_data", "refresh", "update_view", "set_dataframe"):
+                            if hasattr(v_widget, method_name):
+                                try:
+                                    fn = getattr(v_widget, method_name)
+                                    if method_name == "set_dataframe":
+                                        fn(self.current_data.dataframe)
+                                    else:
+                                        fn(self.current_data)
+                                    break
+                                except Exception:
+                                    try:
+                                        fn()
+                                        break
+                                    except Exception:
+                                        pass
+
+        # 4. Перестраиваем Конструктор и Предпросмотр
+        if hasattr(self, "btn_render") and self.btn_render is not None:
+            self.btn_render.setText("🔄  Обновить рендер")
+        if hasattr(self, "layers") and hasattr(self, "report"):
+            self.layers.rebuild(self.report)
+        self._refresh_canvas()
+        self._refresh_report_code()
+        self._push_preview(open_browser=False)
+        ToastManager.success(
+            "Данные обновлены с диска",
+            f"Перечитано таблиц: {max(1, reloaded_count)}. Редактор и графики синхронизированы.",
+            self.theme,
+        )
 
     # ============================================================
     # Подвкладка Код
@@ -387,6 +566,49 @@ class ConstructorTab(QWidget):
         b_prev.clicked.connect(self._on_preview)
         lay.addWidget(b_prev)
 
+        # ── КНОПКА СБРОСА КЭША И ПЕРЕЗАГРУЗКИ ДАННЫХ ИЗ ФАЙЛА ──
+        self.btn_refresh_data = QPushButton("🔄 Обновить данные из файла")
+        self.btn_refresh_data.setCursor(Qt.PointingHandCursor)
+        self.btn_refresh_data.setStyleSheet("""
+            QPushButton {
+                background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0;
+                border-radius: 6px; padding: 6px 12px; font-weight: 600; font-size: 11.5px;
+            }
+            QPushButton:hover {
+                background: #dcfce7;
+            }
+        """)
+        
+        def _on_refresh_data_clicked():
+            # 1. Сбрасываем весь оперативный кэш датафреймов и HTML-рендеров
+            try:
+                from src.core.blocks import DataMemoryCache
+                DataMemoryCache.clear_all()
+            except Exception:
+                pass
+
+            # 2. Получаем менеджер файлов текущего отчёта и перезагружаем активный файл с диска
+            fm = getattr(self.report, "file_manager", None) if hasattr(self, "report") else None
+            if fm and hasattr(fm, "get_files_dict"):
+                try:
+                    files_dict = fm.get_files_dict()
+                    for f_path in files_dict.keys():
+                        if hasattr(fm, "reload_file"):
+                            fm.reload_file(f_path)
+                except Exception as e:
+                    print(f"Ошибка при перезагрузке файла с диска: {e}")
+
+            # 3. Принудительно перестраиваем визуальные слои отчёта (все графики и сводные пересчитаются)
+            if hasattr(self, "layers") and hasattr(self, "report"):
+                self.layers.rebuild(self.report)
+            elif hasattr(self, "_on_preview"):
+                self._on_preview()
+            ToastManager.success("Данные обновлены", "Таблица перечитана с диска", self.theme)
+
+        self.btn_refresh_data.clicked.connect(self.reload_excel_data_everywhere)
+        lay.addWidget(self.btn_refresh_data)
+        # ───────────────────────────────────────────────────────
+
         b_save = QPushButton("💾  Сохранить HTML")
         b_save.setCursor(Qt.PointingHandCursor)
         b_save.setStyleSheet(_btn_qss(self.theme, primary=True))
@@ -408,7 +630,7 @@ class ConstructorTab(QWidget):
         root.addWidget(stub, stretch=1)
 
         return w
-
+    
     def _on_export_html(self):
         from PySide6.QtWidgets import QFileDialog
         from pathlib import Path
@@ -458,11 +680,20 @@ class ConstructorTab(QWidget):
                 if reply != QMessageBox.Yes:
                     return
 
-            ctx = RenderContext(dataframe=df, preview_limit=0)
+            from src.core.blocks import DataMemoryCache
+            DataMemoryCache._render_html_cache.clear()
+
+            ctx = RenderContext(
+                dataframe=df,
+                preview_limit=0,
+                report=self.report,
+                file_manager=getattr(self.report, "file_manager", None),
+            )
             body = render_report(self.report, ctx)
             html = _wrap_html(body, self.report.title or "Отчёт")
             Path(filepath).write_text(html, encoding="utf-8")
             ToastManager.success("HTML сохранён", filepath, self.theme)
+            self._preview.show(html)
             self._preview.open_in_browser()
         except Exception as e:
             import traceback
@@ -482,12 +713,21 @@ class ConstructorTab(QWidget):
             try:
                 df = data.dataframe
             except AttributeError:
-                df = None
+                pass
+        
+        self.inspector.file_manager = getattr(self.report, "file_manager", None)
         self.inspector.set_dataframe(df)
-        self._refresh_canvas()
+        
+        if self._sel_block:
+            found = self.report.find_block(self._sel_block)
+            if found:
+                self.inspector.show_block(found[1])
+        
+        # ВАЖНО: мы БОЛЬШЕ НЕ ВЫЗЫВАЕМ self._refresh_canvas() здесь.
+        # Это предотвращает скачки и перестроение графиков при смене активного файла в Редакторе.
         self._refresh_report_code()
         try:
-            self._push_preview()
+            self._push_preview_debounced()
         except Exception:
             pass
 
@@ -526,7 +766,137 @@ class ConstructorTab(QWidget):
             else:
                 target = self.report.sections[0]
 
+        fm = getattr(self.report, "file_manager", None)
+        def_file, def_sheet = ("", "")
+        if fm is not None and hasattr(fm, "get_default_file_and_sheet"):
+            def_file, def_sheet = fm.get_default_file_and_sheet()
+
+        def _pin_source(c_dict: dict) -> dict:
+            if def_file:
+                c_dict["source_file_name"] = def_file
+            if def_sheet:
+                c_dict["source_sheet"] = def_sheet
+            return c_dict
+
+        # 1. Обработка готовых комбо-связок (Контейнер с привязанными блоками в 1 клик)
+        if block_type.startswith("combo:"):
+            combo_kind = block_type.split(":", 1)[1]
+            if combo_kind == "filter_line":
+                ch_cfg = _pin_source(_default_config("plotly_chart"))
+                ch_cfg.update({"chart_type": "line", "title": "Динамика Факт / Норматив", "width": 75})
+                ch_block = ReportBlock.create("plotly_chart", ch_cfg)
+
+                fl_cfg = _pin_source(_default_config("dashboard_filter"))
+                fl_cfg.update({"width": 25, "target_chart": ch_block.id, "target_charts": [ch_block.id]})
+                fl_block = ReportBlock.create("dashboard_filter", fl_cfg)
+
+                cont_block = ReportBlock.create(
+                    "container",
+                    {"layout": "row", "gap": 14, "width": 100, "children": [fl_block, ch_block]},
+                )
+                target.add_block(cont_block)
+                self._sel_block = cont_block.id
+                self._sel_section = target.id
+                self._refresh_all()
+                self._on_block_selected(cont_block.id)
+                ToastManager.success("Связка добавлена", "Срез + Линейный график созданы и связаны", self.theme)
+                return
+
+            if combo_kind == "filter_donut_text":
+                ch_cfg = _pin_source(_default_config("plotly_chart"))
+                ch_cfg.update({"chart_type": "donut", "title": "Структура отклонений по месяцам", "width": 75})
+                ch_block = ReportBlock.create("plotly_chart", ch_cfg)
+
+                p_cfg = _pin_source(_default_config("paragraph"))
+                p_cfg.update({
+                    "width": 100,
+                    "target_chart": ch_block.id,
+                    "text": (
+                        "📊 Аналитический вывод ({{ group }} — {{ month }}):\n"
+                        "• Суммарный Факт: {{ fact }} | Норматив: {{ norm }} (записей: {{ count }})\n"
+                        "• Результат: {{ if(pct > 0; '⚠ Зафиксирован ПЕРЕРАСХОД на ' + abs_pct + '% (+' + abs_diff + ')'; "
+                        "if(pct < 0; '✅ Достигнута ЭКОНОМИЯ на ' + abs_pct + '% (-' + abs_diff + ')'; 'В пределах нормы (0%)')) }}\n"
+                        "• Наибольший вклад: {{ top_name }} (отклонение {{ top_pct }}%)"
+                    ),
+                })
+                p_block = ReportBlock.create("paragraph", p_cfg)
+
+                fl_cfg = _pin_source(_default_config("dashboard_filter"))
+                fl_cfg.update({
+                    "width": 25,
+                    "target_chart": ch_block.id,
+                    "target_charts": [ch_block.id, p_block.id],
+                    "extra_target_charts": p_block.id,
+                })
+                fl_block = ReportBlock.create("dashboard_filter", fl_cfg)
+
+                cont_block = ReportBlock.create(
+                    "container",
+                    {"layout": "row", "gap": 14, "width": 100, "children": [fl_block, ch_block, p_block]},
+                )
+                target.add_block(cont_block)
+                self._sel_block = cont_block.id
+                self._sel_section = target.id
+                self._refresh_all()
+                self._on_block_selected(cont_block.id)
+                ToastManager.success("Дашборд создан", "Срез, Кольцевая диаграмма и Умный вывод связаны", self.theme)
+                return
+
+            if combo_kind == "two_charts":
+                c1_cfg = _pin_source(_default_config("plotly_chart"))
+                c1_cfg.update({"chart_type": "bar", "title": "График 1 (Столбчатый)", "width": 50})
+                c2_cfg = _pin_source(_default_config("plotly_chart"))
+                c2_cfg.update({"chart_type": "donut", "title": "График 2 (Кольцевой)", "width": 50})
+                b1 = ReportBlock.create("plotly_chart", c1_cfg)
+                b2 = ReportBlock.create("plotly_chart", c2_cfg)
+                cont_block = ReportBlock.create(
+                    "container",
+                    {"layout": "row", "gap": 14, "width": 100, "children": [b1, b2]},
+                )
+                target.add_block(cont_block)
+                self._sel_block = cont_block.id
+                self._sel_section = target.id
+                self._refresh_all()
+                self._on_block_selected(cont_block.id)
+                ToastManager.success("Контейнер создан", "Два графика 50% / 50% добавлены", self.theme)
+                return
+
+        # 2. Обработка быстрых подтипов (например, plotly_chart:donut или paragraph:smart)
+        sub_preset = ""
+        if ":" in block_type:
+            block_type, sub_preset = block_type.split(":", 1)
+
         cfg = _default_config(block_type)
+        if block_type in ("plotly_chart", "dashboard_filter", "data_table", "paragraph", "pivot_matrix", "decomposition", "geo_map"):
+            _pin_source(cfg)
+
+        if block_type == "plotly_chart" and sub_preset in (
+            "combo", "bar", "bar_stacked", "bar_cumulative", "bar_stacked_100", "hbar", "line", "donut", "pie", "area"
+        ):
+            cfg["chart_type"] = sub_preset
+            titles_map = {
+                "combo": "Комбинированный график (Факт / Норматив)",
+                "bar": "Столбчатая диаграмма",
+                "bar_stacked": "Накопительная гистограмма",
+                "bar_cumulative": "Накопительная с нарастающим итогом",
+                "bar_stacked_100": "100% Накопительная гистограмма",
+                "hbar": "Горизонтальная диаграмма",
+                "line": "Линейный график",
+                "donut": "Кольцевая диаграмма",
+                "pie": "Круговая диаграмма",
+                "area": "Площадной график",
+            }
+            cfg["title"] = titles_map.get(sub_preset, "График данных")
+        elif block_type == "paragraph" and sub_preset == "smart":
+            cfg["text"] = (
+                "📊 Аналитический вывод ({{ group }} — {{ month }}):\n"
+                "• Суммарный Факт: {{ fact }} | Норматив: {{ norm }} (записей: {{ count }})\n"
+                "• Результат: {{ if(pct > 0; '⚠ Зафиксирован ПЕРЕРАСХОД на ' + abs_pct + '% (+' + abs_diff + ')'; "
+                "if(pct < 0; '✅ Достигнута ЭКОНОМИЯ на ' + abs_pct + '% (-' + abs_diff + ')'; 'В пределах нормы (0%)')) }}\n"
+                "• Наибольший вклад: {{ top_name }} (отклонение {{ top_pct }}%)"
+            )
+            cfg["raw_html"] = False
+
         block = ReportBlock.create(block_type, cfg)
         target.add_block(block)
 
@@ -554,6 +924,33 @@ class ConstructorTab(QWidget):
             return
         ToastManager.info("Ничего не выбрано", "", self.theme)
 
+    def _mark_render_dirty(self):
+        """Помечает кнопку рендера индикатором несохранённых изменений без перерисовки отчёта."""
+        if hasattr(self, "btn_render") and self.btn_render is not None:
+            self.btn_render.setText("🔄  Обновить рендер ●")
+
+    def _on_manual_render(self):
+        """Единоразово перестраивает холст, код и HTML-отчёт при нажатии на кнопку «Обновить рендер»."""
+        try:
+            from src.core.blocks import DataMemoryCache
+            DataMemoryCache._render_html_cache.clear()
+            DataMemoryCache._filter_df_cache.clear()
+        except Exception:
+            pass
+
+        if hasattr(self, "btn_render") and self.btn_render is not None:
+            self.btn_render.setText("🔄  Обновить рендер")
+        self.layers.rebuild(self.report)
+        if self._sel_block:
+            self.layers.select_block(self._sel_block)
+        self._refresh_canvas()
+        try:
+            self._refresh_report_code()
+        except Exception as e:
+            print(f"[Constructor] code gen error: {e}")
+        self._push_preview(open_browser=False)
+        ToastManager.success("Рендер обновлён", "Настройки применены", self.theme)
+
     def _on_block_selected(self, block_id: str):
         self._sel_block = block_id
         self._sel_section = None
@@ -564,7 +961,6 @@ class ConstructorTab(QWidget):
         self.canvas.select_block(block_id)
         self.layers.select_block(block_id)
         self.inspector.show_block(block)
-        self._push_preview()
 
     def _on_block_moved(self, block_id: str, target_section_id: str, new_index: int):
         ok = self.report.move_block_across(block_id, target_section_id, new_index)
@@ -572,8 +968,10 @@ class ConstructorTab(QWidget):
             return
         self._sel_block = block_id
         self._sel_section = target_section_id
-        self._refresh_all()
+        self.layers.rebuild(self.report)
+        self._refresh_canvas()
         self._on_block_selected(block_id)
+        self._mark_render_dirty()
 
     def _on_block_merge_requested(self, source_id: str, target_id: str):
         ok = self.report.merge_blocks(source_id, target_id, layout="row")
@@ -581,10 +979,12 @@ class ConstructorTab(QWidget):
             return
         self._sel_block = None
         self._sel_section = None
-        self._refresh_all()
+        self.layers.rebuild(self.report)
+        self._refresh_canvas()
+        self._mark_render_dirty()
         ToastManager.success(
             "Блоки объединены",
-            "Теперь они стоят рядом в контейнере.",
+            "Нажмите «Обновить рендер» для обновления предпросмотра.",
             self.theme,
         )
 
@@ -592,7 +992,9 @@ class ConstructorTab(QWidget):
         if self.report.unmerge_container(block_id):
             self._sel_block = None
             self.inspector.show_empty()
-            self._refresh_all()
+            self.layers.rebuild(self.report)
+            self._refresh_canvas()
+            self._mark_render_dirty()
             ToastManager.success("Контейнер разбит", "Блоки возвращены на холст", self.theme)
 
     def _on_block_live_resized(self, block_id: str, width_pct: int, min_height_px: int):
@@ -610,7 +1012,7 @@ class ConstructorTab(QWidget):
         self.inspector.sync_live_geometry(block_id, width_pct, min_height_px)
 
     def _on_block_resized(self, block_id: str, width_pct: int, min_height_px: int):
-        """Фиксирует итоговый размер после отпускания мыши, обновляет код и предпросмотр."""
+        """Фиксирует итоговый размер без запуска тяжёлого рендера."""
         found = self.report.find_block(block_id)
         if found is None:
             return
@@ -620,11 +1022,10 @@ class ConstructorTab(QWidget):
         cfg["min_height"] = min_height_px
         block.config = cfg
         self.inspector.sync_live_geometry(block_id, width_pct, min_height_px)
-        self._refresh_report_code()
-        self._push_preview()
+        self._mark_render_dirty()
 
     def _on_block_position_changed(self, block_id: str, align: str, offset_x: int):
-        """Реакция на смену положения блока в пространстве страницы (лево / центр / право / сдвиг X)."""
+        """Фиксирует положение блока без запуска тяжёлого рендера."""
         found = self.report.find_block(block_id)
         if found is None:
             return
@@ -635,8 +1036,7 @@ class ConstructorTab(QWidget):
         block.config = cfg
         if self._sel_block == block_id:
             self.inspector.show_block(block)
-        self._refresh_report_code()
-        self._push_preview()
+        self._mark_render_dirty()
 
     # ---------- Контекстное меню ----------
 
@@ -696,14 +1096,26 @@ class ConstructorTab(QWidget):
         self.canvas.select_block(None)
 
     def _on_config_changed(self, _block_id: str):
+        # Не перестраиваем холст и графики на каждый клик в Инспекторе!
+        # Обновление произойдёт только по кнопке «Обновить рендер» или «Предпросмотр».
+        self._mark_render_dirty()
+
+    def _on_preview(self):
+        try:
+            from src.core.blocks import DataMemoryCache
+            DataMemoryCache._render_html_cache.clear()
+        except Exception:
+            pass
+        if hasattr(self, "btn_render") and self.btn_render is not None:
+            self.btn_render.setText("🔄  Обновить рендер")
         self.layers.rebuild(self.report)
         if self._sel_block:
             self.layers.select_block(self._sel_block)
         self._refresh_canvas()
-        self._refresh_report_code()
-        self._push_preview_debounced()
-
-    def _on_preview(self):
+        try:
+            self._refresh_report_code()
+        except Exception:
+            pass
         self._push_preview(open_browser=True)
 
     def _push_preview(self, open_browser=False):
@@ -712,16 +1124,44 @@ class ConstructorTab(QWidget):
             if self.current_data is not None:
                 try:
                     df = self.current_data.dataframe
+                    if df is not None and hasattr(self.current_data, "get_display_name"):
+                        rename_map = {
+                            c: self.current_data.get_display_name(c)
+                            for c in df.columns
+                            if self.current_data.get_display_name(c) != c
+                        }
+                        if rename_map:
+                            df = df.rename(columns=rename_map)
                 except AttributeError:
                     df = None
-            ctx = RenderContext(dataframe=df, preview_limit=1000)
+
+            ctx = RenderContext(
+                dataframe=df, 
+                preview_limit=0, # В _push_preview замените на 1000
+                report=self.report,
+                file_manager=getattr(self.report, "file_manager", None)
+            )
             body = render_report(self.report, ctx)
             html = _wrap_html(body, self.report.title or "Отчёт")
+
+            # Сначала обновляем HTML на сервере, и только потом открываем браузер
+            self._preview.show(html)
             if open_browser:
                 self._preview.open_in_browser()
-            self._preview.show(html)
+
         except Exception as e:
-            print(f"[Constructor] preview error: {e}")
+            import traceback
+            traceback.print_exc()
+            error_msg = traceback.format_exc()
+            error_html = (
+                f"<html><body style='padding:40px; font-family:sans-serif;'>"
+                f"<h2 style='color:red;'>🚨 Ошибка рендеринга</h2>"
+                f"<pre style='background:#fee; padding:20px; border-radius:8px;'>{error_msg}</pre>"
+                f"</body></html>"
+            )
+            self._preview.show(error_html)
+            if open_browser:
+                self._preview.open_in_browser()
             BugReporter.capture_exception(e, where="ConstructorTab._push_preview")
 
     def _push_preview_debounced(self):
@@ -748,13 +1188,8 @@ class ConstructorTab(QWidget):
             pass
 
     def _refresh_canvas(self):
-        df = None
-        if self.current_data is not None:
-            try:
-                df = self.current_data.dataframe
-            except AttributeError:
-                df = None
-        self.canvas.rebuild(self.report, df)
+        # Передаем None вместо df, чтобы блоки гарантированно использовали свои жесткие привязки
+        self.canvas.rebuild(self.report, None)
         if self._sel_block:
             self.canvas.select_block(self._sel_block)
 
@@ -809,17 +1244,24 @@ class ConstructorTab(QWidget):
 def _btn_qss(theme, primary=False):
     t = theme
     if primary:
-        bg, color, border, hover = t.primary, t.text_inverse, "none", "#9ade4f"
+        bg, color, border, hover, pressed = t.primary, t.text_inverse, "none", "#9ade4f", "#76b000"
     else:
         bg, color = t.bg_card, t.text_main
-        border, hover = f"1px solid {t.border}", t.bg_hover
+        border, hover, pressed = f"1px solid {t.border}", t.bg_hover, t.bg_panel
     return f"""
         QPushButton {{
             background:{bg}; color:{color}; border:{border};
             border-radius:6px; padding:6px 14px;
             font-size:12px; font-weight:600; min-height:22px;
         }}
-        QPushButton:hover {{ background:{hover}; }}
+        QPushButton:hover {{
+            background:{hover};
+            border:1px solid {t.primary};
+        }}
+        QPushButton:pressed {{
+            background:{pressed};
+            padding-top:7px; padding-bottom:5px;
+        }}
     """
 
 
@@ -856,6 +1298,56 @@ def _html_to_items(html: str) -> list[str]:
 
 
 def _default_config(block_type: str) -> dict:
+    if block_type == "pivot_matrix":
+        return {
+            "title": "Сводная матрица",
+            "row_group_col": "",
+            "row_level2_col": "",
+            "row_level3_col": "",
+            "col_group_col": "",
+            "value_col": "",
+            "value_cols": [],
+            "calc_cols": [],
+            "color_calc_enabled": False,
+            "color_calc_scope": "calc_and_dev",
+            "neg_color": "#16a34a",
+            "pos_color": "#dc2626",
+            "color_calc_bg": True,
+            "sticky_header": True,
+            "sticky_first_col": True,
+            "max_table_height": 520,
+            "show_search": True,
+            "target_table": "",
+            "agg_func": "sum",
+            "show_totals": True,
+            "top_n": 30,
+        }
+    
+    if block_type == "decomposition":
+        return {
+            "title": "Дерево декомпозиции",
+            "tree_mode": "treemap",
+            "level1_col": "",
+            "level2_col": "",
+            "level3_col": "",
+            "value_col": "",
+            "agg_func": "sum",
+            "palette": "Greens",
+            "top_n": 60,
+        }
+    if block_type == "geo_map":
+        return {
+            "title": "География и рейтинг объектов",
+            "map_mode": "ranking_bar",
+            "loc_col": "",
+            "value_col": "",
+            "agg_func": "sum",
+            "palette": "Greens",
+            "top_n": 20,
+        }
+    
+    if block_type == "dashboard_filter":
+        return {"title": "Фильтр", "filter_col": "", "target_chart": "", "width": 25, "align": "left", "offset_x": 0}
     if block_type == "section_title":
         return {"title": "Заголовок", "width": 100}
     if block_type == "paragraph":
@@ -875,7 +1367,14 @@ def _default_config(block_type: str) -> dict:
             "offset_x": 0,
         }
     if block_type == "data_table":
-        return {"max_rows": 20, "width": 100, "align": "left", "offset_x": 0}
+        return {
+            "title": "Реестр путевых листов",
+            "max_rows": 20,
+            "width": 100,
+            "align": "left",
+            "offset_x": 0,
+        }
+    
     if block_type == "plotly_chart":
         return {
             "title": "График данных",
@@ -912,14 +1411,10 @@ def _wrap_html(body: str, title: str) -> str:
     {tab_css}
     *{{box-sizing:border-box}}
     
-    /* Жестко ограничиваем SVG-графики Plotly размерами их контейнеров */
+    /* Ограничиваем ширину графиков контейнером, сохраняя заданную пользователем высоту */
     .js-plotly-plot, .plot-container, .user-select-none {{
         width: 100% !important;
         max-width: 100% !important;
-    }}
-    .main-svg {{
-        width: 100% !important;
-        height: auto !important;
     }}
 
     body{{margin:0;padding:0;font-family:Arial,sans-serif;
@@ -934,15 +1429,14 @@ def _wrap_html(body: str, title: str) -> str:
     }}
     .container-row{{
         display: flex;
-        flex-wrap: wrap; /* Автоматический перенос графиков на новую строку, если не помещаются */
+        flex-wrap: wrap;
         align-items: stretch;
         gap: 16px;
         width: 100%;
         box-sizing: border-box;
-        background: #f8fafc;
-        border: 2px dashed #94a3b8;
-        border-radius: 10px;
-        padding: 14px;
+        background: transparent;
+        border: none;
+        padding: 0;
     }}
     .container-column{{
         display: flex;
@@ -950,10 +1444,35 @@ def _wrap_html(body: str, title: str) -> str:
         gap: 16px;
         width: 100%;
         box-sizing: border-box;
-        background: #f8fafc;
-        border: 2px dashed #94a3b8;
-        border-radius: 10px;
-        padding: 14px;
+        background: transparent;
+        border: none;
+        padding: 0;
+    }}
+    .ea-filter-scroll::-webkit-scrollbar {{
+        width: 6px;
+    }}
+    .ea-filter-scroll::-webkit-scrollbar-track {{
+        background: #f1f5f9;
+        border-radius: 4px;
+    }}
+    .ea-filter-scroll::-webkit-scrollbar-thumb {{
+        background: #cbd5e1;
+        border-radius: 4px;
+    }}
+    .ea-filter-scroll::-webkit-scrollbar-thumb:hover {{
+        background: #87C800;
+    }}
+
+    @keyframes eaFadeInUp {{
+        from {{ opacity: 0; transform: translateY(10px); }}
+        to {{ opacity: 1; transform: translateY(0); }}
+    }}
+    @keyframes eaContentRefresh {{
+        0% {{ opacity: 0.35; transform: scale(0.992) translateY(3px); }}
+        100% {{ opacity: 1; transform: scale(1) translateY(0); }}
+    }}
+    .ea-anim-refresh {{
+        animation: eaContentRefresh 0.34s cubic-bezier(0.22, 1, 0.36, 1) forwards;
     }}
 
     h1.section-title{{
@@ -964,16 +1483,98 @@ def _wrap_html(body: str, title: str) -> str:
         padding-bottom:8px;
         border-bottom:2px solid #87C800;
         scroll-margin-top: 25px;
+        animation: eaFadeInUp 0.4s ease-out both;
     }}
-    .block{{margin-bottom:0; display:block; min-width:0; width:100%;}}
-    .block-card{{background:#fff;border:1px solid #e0e0e5;border-radius:10px;padding:20px;min-width:0;width:100%;}}
+    .block{{
+        margin-bottom:0;
+        display:block;
+        min-width:0;
+        width:100%;
+        animation: eaFadeInUp 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+    }}
+    .block-card{{
+        background:#fff;
+        border:1px solid #e0e0e5;
+        border-radius:10px;
+        padding:20px;
+        min-width:0;
+        width:100%;
+        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.03);
+        transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1),
+                    box-shadow 0.25s cubic-bezier(0.22, 1, 0.36, 1),
+                    border-color 0.25s ease;
+    }}
+    .block-card:hover{{
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.07);
+        border-color: #cbd5e1;
+    }}
 
     .kpi-row{{display:flex;gap:16px;flex-wrap:wrap}}
-    .kpi-card{{flex:1 1 120px;background:#fff;border:1px solid #e0e0e5;
-              border-radius:10px;padding:16px}}
+    .kpi-card{{
+        flex:1 1 120px;
+        background:#fff;
+        border:1px solid #e0e0e5;
+        border-radius:10px;
+        padding:16px;
+        transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+                    box-shadow 0.22s cubic-bezier(0.22, 1, 0.36, 1),
+                    border-color 0.22s ease;
+    }}
+    .kpi-card:hover{{
+        transform: translateY(-3px);
+        box-shadow: 0 8px 18px rgba(43, 178, 76, 0.12);
+        border-color: #87C800;
+    }}
     .kpi-value{{font-size:26px;font-weight:700}}
     .kpi-value.accent{{color:#2bb24c}}
     .kpi-label{{color:#666;font-size:12px;margin-top:4px}}
+
+    /* Анимации кнопок месяцев, элементов среза и поиска */
+    .ea-pie-month-btn {{
+        transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+                    background-color 0.2s ease,
+                    color 0.2s ease,
+                    box-shadow 0.2s ease !important;
+    }}
+    .ea-pie-month-btn:hover {{
+        transform: translateY(-2px);
+        box-shadow: 0 4px 10px rgba(135, 200, 0, 0.25);
+    }}
+    .ea-pie-month-btn:active {{
+        transform: translateY(0) scale(0.96);
+    }}
+
+    .ea-filter-item {{
+        transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+                    background-color 0.2s ease,
+                    color 0.2s ease,
+                    padding-left 0.18s ease,
+                    box-shadow 0.2s ease !important;
+    }}
+    .ea-filter-item:hover:not(.active) {{
+        background: #f1f8e9 !important;
+        color: #003F0B !important;
+        transform: translateX(4px);
+    }}
+    .ea-filter-item.active {{
+        box-shadow: 0 3px 10px rgba(135, 200, 0, 0.32);
+    }}
+    .ea-filter-item:active {{
+        transform: scale(0.98);
+    }}
+
+    .ea-table-search-btn {{
+        transition: transform 0.18s ease, background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease !important;
+    }}
+    .ea-table-search-btn:hover {{
+        background: #f8fafc !important;
+        border-color: #87C800 !important;
+        transform: translateY(-1px);
+        box-shadow: 0 3px 8px rgba(0,0,0,0.06);
+    }}
+    .ea-table-search-btn:active {{
+        transform: translateY(0) scale(0.97);
+    }}
 
     .section-divider{{height:1px;background:#ddd;margin:20px 0}}
 
@@ -987,61 +1588,90 @@ def _wrap_html(body: str, title: str) -> str:
     .paragraph li, .list-rich li{{margin:2px 0; line-height:1.5}}
     .block-list{{margin:0;padding-left:22px}}
 
+    :root {{
+        --toc-width: clamp(185px, 17vw, 250px);
+    }}
     .report-toc{{
         position:fixed;
         left:0; top:0;
-        width:260px;
+        width:var(--toc-width);
         height:100vh;
         background:#ffffff;
         border-right:1px solid #e0e0e0;
         overflow-y:auto;
-        padding:20px;
+        padding:16px;
         box-shadow:2px 0 5px rgba(0,0,0,0.05);
         z-index:100;
     }}
     .report-toc h2{{
-        font-size:1.3rem;
-        margin:0 0 20px 0;
+        font-size:1.15rem;
+        margin:0 0 14px 0;
         color:#003F0B;
         border-bottom:2px solid #87C800;
         padding-bottom:8px;
     }}
     .report-toc ul{{list-style:none;padding-left:0;margin:0;}}
-    .report-toc ul li{{margin:6px 0;}}
+    .report-toc ul li{{margin:5px 0;}}
     .toc-item{{
         text-decoration:none;
         color:#195532;
         font-weight:500;
-        font-size:13px;
+        font-size:12.5px;
         display:block;
-        padding:4px 8px;
-        border-radius:4px;
-        transition:background 0.2s;
+        padding:6px 10px;
+        border-radius:6px;
+        transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+                    background-color 0.2s ease,
+                    color 0.2s ease,
+                    box-shadow 0.2s ease;
         cursor:pointer;
     }}
-    .toc-item:hover{{background:#e9f5e9;color:#003F0B;}}
-    .toc-item.active{{background:#87C800;color:#ffffff;font-weight:bold;}}
+    .toc-item:hover{{
+        background:#e9f5e9;
+        color:#003F0B;
+        transform: translateX(4px);
+    }}
+    .toc-item.active{{
+        background:#87C800;
+        color:#ffffff;
+        font-weight:bold;
+        box-shadow: 0 3px 8px rgba(135, 200, 0, 0.28);
+    }}
 
     .report-content{{
-        margin-left:260px;
-        padding:20px 30px 40px;
-        max-width:calc(100% - 260px);
+        margin-left:var(--toc-width);
+        padding:16px clamp(14px, 2.2vw, 30px) 36px;
+        width:calc(100% - var(--toc-width));
+        max-width:calc(100% - var(--toc-width));
     }}
     .section-anchor{{scroll-margin-top:20px;}}
 
-    @media (max-width: 768px) {{
+    @media (max-width: 1024px) {{
+        .ea-container-cell {{
+            min-width: 240px;
+        }}
+    }}
+
+    @media (max-width: 860px) {{
         .report-toc{{
             position:static;
             width:100%;
             height:auto;
             border-right:none;
             border-bottom:1px solid #e0e0e0;
-            margin-bottom:15px;
+            margin-bottom:12px;
         }}
-        .report-content{{margin-left:0;width:100%;padding:15px;}}
+        .report-content{{
+            margin-left:0;
+            width:100%;
+            max-width:100%;
+            padding:12px;
+        }}
     }}
+    
 </style>
 <script src="data:text/javascript;base64,{tab_js_b64}"></script>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 </head>
 <body>
 {body}

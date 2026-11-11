@@ -1034,50 +1034,49 @@ class DataTableWidget(BlockWidget):
 
 
 class ContainerWidget(BlockWidget):
-    """Контейнер с вложенными блоками: каждый график имеет свои четкие границы и переносится вниз при нехватке места."""
-
+    """Виджет контейнера на холсте, учитывающий индивидуальную ширину каждого вложенного блока."""
     def __init__(self, block_id, config, dataframe=None, parent=None, theme=None):
         super().__init__(block_id, parent, theme)
-
+        
         layout_kind = config.get("layout", "row")
         gap = int(config.get("gap", 14))
-
-        box = QHBoxLayout(self)
-        box.setContentsMargins(12, 12, 12, 12)
-        box.setSpacing(gap)
-
-        self.setStyleSheet(
-            "ContainerWidget { background: #f8fafc; border: 2px dashed #94a3b8; "
-            "border-radius: 8px; }"
-        )
-
-        children = config.get("children", [])
-        n_children = max(1, len(children))
-
-        for child in children:
-            if hasattr(child, "id"):
-                cid = child.id
-                ctype = child.type
-                ccfg = child.config
-            else:
-                cid = child.get("id", "")
-                ctype = child.get("type", "paragraph")
-                ccfg = child.get("config", {})
-
-            child_widget = make_block_widget(ctype, cid, ccfg, dataframe, self, theme)
-            child_widget.clicked.connect(self._on_child_clicked)
+        
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        
+        inner_container = QWidget()
+        inner_container.setStyleSheet("background: transparent;")
+        
+        if layout_kind == "row":
+            inner_layout = QHBoxLayout(inner_container)
+        else:
+            inner_layout = QVBoxLayout(inner_container)
             
-            # Если ряд, даем каждому блоку независимую ширину с учетом отступов, но не даем «слепляться»
-            if layout_kind == "row":
-                child_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-                box.addWidget(child_widget, 1)
-            else:
-                child_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-                box.addWidget(child_widget)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        inner_layout.setSpacing(gap)
+        
+        children_specs = config.get("children", [])
+        n_children = max(1, len(children_specs))
+        default_w = max(20, 100 // n_children)
 
-    def _on_child_clicked(self, child_id: str):
-        self.clicked.emit(child_id)
-
+        for child_spec in children_specs:
+            c_type = child_spec.get("type", "") if isinstance(child_spec, dict) else getattr(child_spec, "type", "")
+            c_id = child_spec.get("id", "") if isinstance(child_spec, dict) else getattr(child_spec, "id", "")
+            c_cfg = child_spec.get("config", {}) if isinstance(child_spec, dict) else getattr(child_spec, "config", {})
+            
+            c_width = int(c_cfg.get("width", default_w))
+            
+            child_w = make_block_widget(c_type, c_id, c_cfg, dataframe, parent, theme)
+            if child_w:
+                if layout_kind == "row":
+                    # Устанавливаем политику размеров в Expanding, чтобы Qt разрешил блоку сжиматься и растягиваться
+                    child_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                    inner_layout.addWidget(child_w, stretch=max(1, c_width))
+                else:
+                    child_w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                    inner_layout.addWidget(child_w)
+                
+        main_layout.addWidget(inner_container)
 
 # ============================================================
 # Хелперы и Фабрика
@@ -1108,6 +1107,38 @@ def _extract_body_local(html: str) -> str:
         return html[gt + 1:]
     return html[gt + 1:end]
 
+class DashboardFilterWidget(BlockWidget):
+    def __init__(self, block_id, config, dataframe=None, parent=None, theme=None):
+        super().__init__(block_id, parent, theme)
+        self.setMinimumHeight(150)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(8)
+        
+        title_lbl = QLabel(config.get("title", "Фильтр"))
+        title_lbl.setStyleSheet("font-weight: bold; color: #003F0B; font-size: 14px; border-bottom: 2px solid #87C800;")
+        layout.addWidget(title_lbl)
+        
+        items_layout = QVBoxLayout()
+        items_layout.setSpacing(2)
+        
+        btn_all = QLabel("Все значения")
+        btn_all.setStyleSheet("background: #87C800; color: white; padding: 6px 10px; border-radius: 4px; font-weight: bold; font-size: 12px;")
+        items_layout.addWidget(btn_all)
+        
+        col = config.get("filter_col", "")
+        vals = ["Значение 1", "Значение 2", "Значение 3"]
+        if dataframe is not None and col in dataframe.columns:
+            vals = sorted(dataframe[col].dropna().unique().astype(str))[:8]
+        
+        for v in vals:
+            lbl = QLabel(v)
+            lbl.setStyleSheet("background: transparent; color: #333; padding: 4px 10px; font-size: 12px;")
+            items_layout.addWidget(lbl)
+        
+        items_layout.addStretch()
+        layout.addLayout(items_layout)
 
 def make_block_widget(block_type, block_id, config, dataframe=None, parent=None, theme=None):
     config = config if config is not None else {}
@@ -1125,6 +1156,8 @@ def make_block_widget(block_type, block_id, config, dataframe=None, parent=None,
         w = DataTableWidget(block_id, config, dataframe, parent, theme)
     elif block_type == "plotly_chart":
         w = PlotlyChartWidget(block_id, config, dataframe, parent, theme)
+    elif block_type == "dashboard_filter":
+        w = DashboardFilterWidget(block_id, config, dataframe, parent, theme)
     elif block_type == "container":
         w = ContainerWidget(block_id, config, dataframe, parent, theme)
     else:

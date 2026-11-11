@@ -73,6 +73,9 @@ class RenameColumnCommand(Command):
         self._prev_name = None
 
     def do(self):
+        if self._column not in self._data.columns:
+            return
+            
         self._prev_name = self._data.get_display_name(self._column)
         self._data.set_display_name(self._column, self._new_name)
 
@@ -82,9 +85,10 @@ class RenameColumnCommand(Command):
             "prev_name": self._prev_name,
         })
 
-        # ★ Раньше on_change не вызывался — из-за этого UI (дерево колонок,
-        # таблица, инспектор) не перерисовывался после переименования.
-        self._data.invalidate_cache()
+        # Принудительно инвалидируем кэш метаданных колонок для корректного отображения
+        if hasattr(self._data, "invalidate_cache"):
+            self._data.invalidate_cache()
+            
         if self._on_change:
             self._on_change()
 
@@ -777,16 +781,24 @@ class ExtractTextCommand(Command):
                 name_ext = f"{col}_извлечено"
                 name_err = f"{col}_ошибки"
 
-                # ★ Если такие колонки уже есть (повторное извлечение) —
-                #   сначала удаляем их, иначе dataframe.insert упадёт
-                #   с "cannot insert, already exists".
-                if name_ext in self._data.columns:
-                    self._drop_existing_column(name_ext)
-                if name_err in self._data.columns:
-                    self._drop_existing_column(name_err)
+                # Безопасное удаление старых сгенерированных колонок перед повторным извлечением
+                for target_name in (name_ext, name_err):
+                    if target_name in self._data.dataframe.columns:
+                        self._data.dataframe = self._data.dataframe.drop(columns=[target_name])
+                    if target_name in self._data.columns:
+                        self._data.columns.remove(target_name)
+                    if target_name in self._data.column_order:
+                        self._data.column_order.remove(target_name)
+                    if target_name in self._data.visible_columns:
+                        self._data.visible_columns.remove(target_name)
+                    self._data.dtypes.pop(target_name, None)
+                    self._data.column_meta.pop(target_name, None)
 
-                # Индекс мог сдвинуться после удаления — пересчитываем
-                idx = self._data.columns.index(col)
+                # Корректно пересчитываем индекс исходной колонки после очистки
+                if col in self._data.columns:
+                    idx = self._data.columns.index(col)
+                else:
+                    idx = min(0, len(self._data.columns))
 
                 made_ext = False
                 made_err = False
@@ -1403,3 +1415,136 @@ class NormalizeTextCommand(Command):
     @property
     def log(self) -> list:
         return self._log
+
+    # ============================================================
+# 🛠 Склеить двухуровневую шапку (убирает Unnamed)
+# ============================================================
+
+class MergeHeadersCommand(Command):
+    """
+    Берет текущие имена колонок (где могут быть Unnamed: X),
+    заполняет пустые названия вправо, склеивает их со значениями
+    из первой строки данных, и делает это новой шапкой.
+    """
+
+    def __init__(self, data, on_change=None):
+        self._data = data
+        self._on_change = on_change
+
+        self._backup_df = None
+        self._backup_columns = None
+        self._backup_dtypes = None
+        self._backup_meta = None
+        self._backup_order = None
+        self._backup_visible = None
+        self._backup_filters = None
+        self._backup_cols_count = None
+        self._backup_rows_count = None
+
+        self._ok = False
+        self._message = ""
+
+    def do(self):
+        if self._data is None or len(self._data.dataframe) < 1:
+            self._message = "Нет данных для склейки"
+            return
+
+        # ── Backup ──
+        self._backup_df = self._data.dataframe.copy()
+        self._backup_columns = list(self._data.columns)
+        self._backup_dtypes = dict(self._data.dtypes)
+        self._backup_meta = {k: dict(v) for k, v in self._data.column_meta.items()}
+        self._backup_order = list(self._data.column_order)
+        self._backup_visible = list(self._data.visible_columns)
+        self._backup_filters = dict(self._data.column_filters)
+        self._backup_cols_count = self._data.cols_count
+        self._backup_rows_count = self._data.rows_count
+
+        try:
+            df = self._data.dataframe.copy()
+            old_cols = list(df.columns)
+            first_row = df.iloc[0].fillna("").astype(str).tolist()
+
+            new_cols = []
+            last_valid_top = ""
+            
+            for i, col in enumerate(old_cols):
+                top_str = str(col)
+                # Если колонка называется Unnamed: X, значит это объединенная ячейка
+                if "Unnamed:" in top_str or top_str == "":
+                    top_part = last_valid_top
+                else:
+                    top_part = top_str
+                    last_valid_top = top_str
+                
+                bottom_part = first_row[i].strip()
+                
+                # Склеиваем
+                if top_part and bottom_part:
+                    new_name = f"{top_part}_{bottom_part}"
+                elif top_part:
+                    new_name = top_part
+                elif bottom_part:
+                    new_name = bottom_part
+                else:
+                    new_name = f"Колонка_{i}"
+                    
+                new_cols.append(new_name)
+
+            # Переименовываем
+            df.columns = new_cols
+            # Удаляем первую строку, так как она ушла в шапку
+            df = df.iloc[1:].reset_index(drop=True)
+
+            self._data.dataframe = df
+            self._data.columns = list(df.columns)
+            self._data.dtypes = {c: str(t) for c, t in df.dtypes.items()}
+            self._data.rows_count = len(df)
+            self._data.cols_count = len(df.columns)
+            
+            # Сбрасываем метаданные
+            self._data.column_meta = {}
+            self._data.column_order = list(df.columns)
+            self._data.visible_columns = list(df.columns)
+            self._data.column_filters = {}
+
+            self._ok = True
+
+            _log_operation(self._data, "merge_headers", {})
+
+            self._data.invalidate_cache()
+            if self._on_change:
+                self._on_change()
+
+            self._message = "Двухуровневая шапка успешно склеена"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.undo() # Восстанавливаем бэкап
+            self._message = f"Ошибка: {type(e).__name__}: {e}"
+
+    def undo(self):
+        if self._backup_df is None:
+            return
+
+        self._data.dataframe = self._backup_df
+        self._data.columns = self._backup_columns
+        self._data.dtypes = self._backup_dtypes
+        self._data.column_meta = self._backup_meta
+        self._data.column_order = self._backup_order
+        self._data.visible_columns = self._backup_visible
+        self._data.column_filters = self._backup_filters
+        self._data.cols_count = self._backup_cols_count
+        self._data.rows_count = self._backup_rows_count
+
+        ops = getattr(self._data, "operations", None)
+        if ops:
+            ops.pop_last()
+
+        self._data.invalidate_cache()
+        if self._on_change:
+            self._on_change()
+
+    def description(self) -> str:
+        return "Склеить двухуровневую шапку"

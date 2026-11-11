@@ -196,13 +196,19 @@ class FilterPopup(QWidget):
         self.list_widget.blockSignals(False)
 
     def _on_ok(self):
+        has_search = bool(self.edit_search.text().strip())
         allowed = []
+        
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
+            # Если есть поиск, игнорируем скрытые строки
+            if has_search and item.isHidden():
+                continue
             if item.checkState() == Qt.Checked:
                 allowed.append(item.text())
 
-        if len(allowed) == len(self.unique_values):
+        # Если поиска не было и выбрано всё — это значит "снять фильтр"
+        if not has_search and len(allowed) == len(self.unique_values):
             self.applied.emit(self.column_name, [])
         else:
             self.applied.emit(self.column_name, allowed)

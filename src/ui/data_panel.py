@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, Signal
 class DataPanel(QWidget):
     """Панель операций над данными."""
 
-    # Сигналы наружу
+# Сигналы наружу
     sort_reset_requested = Signal()
     filter_remove_requested = Signal(str)   # column_name (real)
     filters_reset_requested = Signal()
@@ -21,6 +21,7 @@ class DataPanel(QWidget):
     drop_na_requested = Signal()
     normalize_text_requested = Signal()
     extract_text_requested = Signal()
+    merge_headers_requested = Signal()      # <--- НОВЫЙ СИГНАЛ
 
     def __init__(self, theme, parent=None):
         super().__init__(parent)
@@ -205,12 +206,20 @@ class DataPanel(QWidget):
         self.btn_normalize_text.setStyleSheet(self._btn_action_style())
         layout.addWidget(self.btn_normalize_text)
 
-        # ★ Извлечение по шаблону (regex) — гос. номер, VIN и т.д.
+# ★ Извлечение по шаблону (regex) — гос. номер, VIN и т.д.
         self.btn_extract_text = QPushButton("✂   Извлечь по шаблону…")
         self.btn_extract_text.setCursor(Qt.PointingHandCursor)
         self.btn_extract_text.clicked.connect(self.extract_text_requested.emit)
         self.btn_extract_text.setStyleSheet(self._btn_action_style())
         layout.addWidget(self.btn_extract_text)
+        
+        # ★ Объединение двухуровневой шапки
+        self.btn_merge_headers = QPushButton("🛠   Склеить 2-уровневую шапку")
+        self.btn_merge_headers.setCursor(Qt.PointingHandCursor)
+        self.btn_merge_headers.setToolTip("Склеивает заголовки (Unnamed: X) со строкой под ними")
+        self.btn_merge_headers.clicked.connect(self.merge_headers_requested.emit)
+        self.btn_merge_headers.setStyleSheet(self._btn_action_style())
+        layout.addWidget(self.btn_merge_headers)
 
         layout.addStretch()
 

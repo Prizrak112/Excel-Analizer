@@ -32,6 +32,46 @@ class ReportBlock:
             config=config or {},
         )
 
+    def to_dict(self) -> dict:
+        """Сериализует блок и все его настройки (включая дочерние блоки контейнера) в словарь."""
+        import copy
+        cfg = copy.deepcopy(self.config or {})
+        if self.type == "container" and "children" in cfg:
+            serialized_children = []
+            for ch in cfg.get("children", []):
+                if hasattr(ch, "to_dict"):
+                    serialized_children.append(ch.to_dict())
+                elif isinstance(ch, dict):
+                    serialized_children.append(copy.deepcopy(ch))
+            cfg["children"] = serialized_children
+        return {
+            "id": self.id,
+            "type": self.type,
+            "config": cfg,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ReportBlock":
+        """Восстанавливает блок и его дочерние элементы из словаря."""
+        import copy
+        if isinstance(data, ReportBlock):
+            return data
+        cfg = copy.deepcopy(data.get("config") or {})
+        b_type = data.get("type", "paragraph")
+        if b_type == "container" and "children" in cfg:
+            restored_children = []
+            for ch in cfg.get("children", []):
+                if isinstance(ch, ReportBlock):
+                    restored_children.append(ch)
+                elif isinstance(ch, dict):
+                    restored_children.append(cls.from_dict(ch))
+            cfg["children"] = restored_children
+        return cls(
+            id=data.get("id") or _generate_id(),
+            type=b_type,
+            config=cfg,
+        )
+
     # ---------- Размеры и Позиция в пространстве ----------
 
     def get_width(self) -> int:
@@ -105,6 +145,44 @@ class Report:
     title: str = "Новый отчёт"
     sections: list[Section] = field(default_factory=list)
     theme: str = "gsm_green"
+    file_manager: object = field(default=None, repr=False)
+
+    def get_block_dataframe(self, cfg: dict | None, fallback_df=None):
+        """Возвращает DataFrame, жёстко закреплённый за блоком в его config (игнорируя активный файл)."""
+        cfg = cfg or {}
+        if self.file_manager is None:
+            return fallback_df
+
+        source_file_name = cfg.get("source_file_name", "")
+        source_sheet = cfg.get("source_sheet", "") or cfg.get("source_file", "")
+
+        # Если это срез (фильтр) без своего листа, но привязан к графику — берём лист графика
+        if not source_sheet and cfg.get("target_chart"):
+            found = self.find_block(cfg["target_chart"])
+            if found is not None:
+                _, chart_block = found
+                c_cfg = chart_block.config or {}
+                source_file_name = c_cfg.get("source_file_name", "") or source_file_name
+                source_sheet = c_cfg.get("source_sheet", "") or c_cfg.get("source_file", "")
+
+        # 1. Строгое совпадение по выбранному файлу
+        if source_file_name or (source_sheet and source_sheet != "— Авто (первый лист) —"):
+            df = self.file_manager.get_dataframe(source_file_name, source_sheet)
+            if df is not None:
+                return df
+            return None  # Не откатываемся на случайный файл, если выбранный удалён!
+
+        # 2. Если файл не выбран, берём первый доступный файл из проекта
+        if hasattr(self.file_manager, "get_files_dict"):
+            files_dict = self.file_manager.get_files_dict()
+            if files_dict:
+                first_file = next(iter(files_dict.keys()))
+                first_sheet = files_dict[first_file][0] if files_dict[first_file] else ""
+                df = self.file_manager.get_dataframe(first_file, first_sheet)
+                if df is not None:
+                    return df
+
+        return fallback_df
     
     # ---------- Разделы ----------
     
@@ -228,6 +306,47 @@ class Report:
             "sections": len(self.sections),
             "blocks": total_blocks,
         }
+
+    def to_dict(self) -> dict:
+        """Сохраняет всю структуру отчёта Конструктора (разделы, блоки и их настройки)."""
+        return {
+            "title": self.title,
+            "theme": self.theme,
+            "sections": [
+                {
+                    "id": s.id,
+                    "title": s.title,
+                    "icon": s.icon,
+                    "expanded": s.expanded,
+                    "blocks": [b.to_dict() for b in s.blocks],
+                }
+                for s in self.sections
+            ],
+        }
+
+    def load_from_dict(self, data: dict | None):
+        """Восстанавливает разделы, блоки и их настройки в существующий объект Report."""
+        if not data or not isinstance(data, dict):
+            return
+        self.title = data.get("title", self.title)
+        self.theme = data.get("theme", self.theme)
+        restored_sections = []
+        for s_data in data.get("sections", []):
+            if not isinstance(s_data, dict):
+                continue
+            sec = Section(
+                id=s_data.get("id") or _generate_id(),
+                title=s_data.get("title", "Раздел"),
+                icon=s_data.get("icon", "📊"),
+                expanded=bool(s_data.get("expanded", True)),
+                blocks=[
+                    ReportBlock.from_dict(b_data)
+                    for b_data in s_data.get("blocks", [])
+                    if isinstance(b_data, (dict, ReportBlock))
+                ],
+            )
+            restored_sections.append(sec)
+        self.sections = restored_sections
 
 
 # ============================================================

@@ -295,14 +295,17 @@ class ExtractRuleBuilder:
             if val is None:
                 uncovered.append(i)
                 continue
-            try:
-                if pd.isna(val):
-                    uncovered.append(i)
-                    continue
-            except (TypeError, ValueError):
-                pass
+            
+            # Быстрый и безопасный чек на пропуски pandas/numpy
+            if pd.isna(val):
+                uncovered.append(i)
+                continue
 
-            s = str(val)
+            s = str(val).strip()
+            if not s:
+                uncovered.append(i)
+                continue
+
             m = rx.search(s)
             if m and m.group(1):
                 covered.append(i)

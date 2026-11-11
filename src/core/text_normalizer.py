@@ -43,6 +43,9 @@ _CYR_LETTERS = set(
 # Главная функция
 # ============================================================
 
+import numbers
+import math
+
 def normalize_value(
     s,
     *,
@@ -51,35 +54,17 @@ def normalize_value(
     remove_spaces: bool = True,
     remove_chars: set[str] | None = None,
 ) -> tuple[str, bool]:
-    """
-    Нормализовать одно значение.
-
-    direction: "lat2cyr" | "cyr2lat"
-    upper: привести к верхнему регистру
-    remove_spaces: удалить все пробельные символы
-    remove_chars: набор символов для удаления (например, {".", "-", "№"})
-
-    Возвращает (результат, ok).
-    """
     # ── 1. Числа и None сразу в ошибку ──
     if s is None:
         return "", False
 
     # Проверка "число без букв" (int, float, numpy и т.п.)
-    try:
-        import numbers
-        if isinstance(s, numbers.Number):
-            return str(s), False
-    except Exception:
-        pass
+    if isinstance(s, numbers.Number):
+        return str(s), False
 
     # NaN
-    try:
-        import math
-        if isinstance(s, float) and math.isnan(s):
-            return "", False
-    except Exception:
-        pass
+    if isinstance(s, float) and math.isnan(s):
+        return "", False
 
     text = str(s)
 
@@ -109,11 +94,19 @@ def normalize_value(
 
     # ── 5. Замена букв ──
     if direction == "lat2cyr":
-        text = "".join(_LAT_TO_CYR.get(ch, ch) for ch in text)
-        forbidden = _LAT_LETTERS  # остались латинские → ошибка
+        text = "".join(
+            _LAT_TO_CYR.get(ch.upper(), ch.upper()).lower() if ch.islower() else _LAT_TO_CYR.get(ch, ch)
+            for ch in text
+        )
+        # Добавляем к проверке строчные варианты букв
+        forbidden = _LAT_LETTERS | set(c.lower() for c in _LAT_LETTERS)
     elif direction == "cyr2lat":
-        text = "".join(_CYR_TO_LAT.get(ch, ch) for ch in text)
-        forbidden = _CYR_LETTERS  # остались кириллические → ошибка
+        text = "".join(
+            _CYR_TO_LAT.get(ch.upper(), ch.upper()).lower() if ch.islower() else _CYR_TO_LAT.get(ch, ch)
+            for ch in text
+        )
+        # Добавляем к проверке строчные варианты букв
+        forbidden = _CYR_LETTERS | set(c.lower() for c in _CYR_LETTERS)
     else:
         # неизвестное направление — ничего не делаем
         return text, False

@@ -11,8 +11,9 @@ ok=False, если:
   • шаблон не найден в строке,
   • regex некорректен.
 """
-
 import re
+import math
+from functools import lru_cache
 
 
 # ============================================================
@@ -47,24 +48,16 @@ PRESETS: list[tuple[str, str, str]] = [
 # ============================================================
 # Главная функция
 # ============================================================
+@lru_cache(maxsize=128)
+def _get_compiled_regex(pattern: str):
+    return re.compile(pattern)
 
 def extract_value(s, pattern: str) -> tuple[str, bool]:
-    """
-    Извлечь фрагмент из значения по regex-шаблону.
-
-    Если в шаблоне есть группа захвата — берётся группа 1.
-    Если групп нет — берётся всё найденное совпадение.
-    """
-    # ── None / NaN / пусто ──
     if s is None:
         return "", False
 
-    try:
-        import math
-        if isinstance(s, float) and math.isnan(s):
-            return "", False
-    except Exception:
-        pass
+    if isinstance(s, float) and math.isnan(s):
+        return "", False
 
     text = str(s)
     if not text.strip():
@@ -73,9 +66,9 @@ def extract_value(s, pattern: str) -> tuple[str, bool]:
     if not pattern:
         return "", False
 
-    # ── Компиляция regex ──
+    # ── Кэшированная компиляция regex ──
     try:
-        rx = re.compile(pattern)
+        rx = _get_compiled_regex(pattern)
     except re.error:
         return "", False
 
