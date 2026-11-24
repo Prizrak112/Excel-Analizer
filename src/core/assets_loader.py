@@ -7,10 +7,34 @@
 
 from functools import lru_cache
 from pathlib import Path
+import sys
 
 
-# src/core/assets_loader.py → src/assets/
-_ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
+def _resolve_assets_dir() -> Path:
+    """Находит папку src/assets при обычном запуске и внутри PyInstaller --onefile."""
+    candidates: list[Path] = []
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        base = Path(meipass)
+        candidates.append(base / "src" / "assets")
+        candidates.append(base / "assets")
+
+    file_path = globals().get("__file__")
+    if file_path:
+        candidates.append(Path(file_path).resolve().parent.parent / "assets")
+
+    exe_dir = Path(sys.executable).resolve().parent
+    candidates.append(exe_dir / "src" / "assets")
+    candidates.append(Path.cwd() / "src" / "assets")
+
+    for cand in candidates:
+        if cand.is_dir():
+            return cand
+    return candidates[0] if candidates else Path("src/assets")
+
+
+_ASSETS_DIR = _resolve_assets_dir()
 
 
 @lru_cache(maxsize=8)
@@ -20,7 +44,8 @@ def load_asset(name: str) -> str:
     Возвращает пустую строку, если файл не найден.
     """
     path = _ASSETS_DIR / name
-    if not path.exists():
+    if not path.is_file():
+        print(f"[assets_loader] Ассет не найден: {path}")
         return ""
     try:
         return path.read_text(encoding="utf-8")

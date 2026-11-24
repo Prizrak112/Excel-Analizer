@@ -187,6 +187,12 @@ def create_block(spec: ReportBlock, ctx: RenderContext) -> Block:
             "date_col": str(cfg.get("date_col", "") or ""),
             "min_slice_pct": float(cfg.get("min_slice_pct", 0.0) or 0.0),
             "slice_pct_mode": str(cfg.get("slice_pct_mode", "ge") or "ge"),
+            "pie_display_mode": str(cfg.get("pie_display_mode", "single_interactive") or "single_interactive"),
+            "dut_col": str(cfg.get("dut_col", "") or ""),
+            "pct_col": str(cfg.get("pct_col", "") or ""),
+            "dut_pct_op": str(cfg.get("dut_pct_op", "gt") or "gt"),
+            "dut_pct_val": float(cfg.get("dut_pct_val", 3.0) if cfg.get("dut_pct_val", None) is not None else 3.0),
+            "dut_count_mode": str(cfg.get("dut_count_mode", "unique_ts") or "unique_ts"),
             "combo_series": list(cfg.get("combo_series") or []),
             "combo_barmode": str(cfg.get("combo_barmode", "group") or "group"),
             "combo_y2_title": str(cfg.get("combo_y2_title", "") or ""),
@@ -201,6 +207,8 @@ def create_block(spec: ReportBlock, ctx: RenderContext) -> Block:
             "combo_level2_sort": str(cfg.get("combo_level2_sort", "value_desc") or "value_desc"),
             "combo_level3_sort": str(cfg.get("combo_level3_sort", "value_desc") or "value_desc"),
             "combo_sort_series_idx": int(cfg.get("combo_sort_series_idx", 0) or 0),
+            "anim_style": str(cfg.get("anim_style", "auto") or "auto"),
+            "anim_speed": int(cfg.get("anim_speed", 480) or 480),
         }
         filtered_kwargs = {k: v for k, v in chart_kwargs.items() if k in sig.parameters}
         b = PlotlyChartBlock(**filtered_kwargs, **layout_kwargs)

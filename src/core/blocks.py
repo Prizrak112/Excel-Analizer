@@ -4,9 +4,14 @@
 (по столбцам и по строкам с выбором конкретных столбцов), условия фильтрации и срезы.
 """
 
+from collections import OrderedDict
 import json
+import math
 import re
+import threading
+import weakref
 from dataclasses import dataclass, field
+import numpy as np
 import pandas as pd
 
 
@@ -29,18 +34,52 @@ def _ensure_series(obj) -> pd.Series:
 
 class DataMemoryCache:
     """
-    Единое оперативное хранилище (In-Memory Cache).
-    Загружает и обрабатывает каждую таблицу и колонку только 1 раз,
-    отдавая готовые данные из оперативной памяти без повторного чтения базы.
+    Оперативное хранилище (In-Memory Cache) с авто-освобождением памяти
+    через weakref.finalize, лимитами LRU и потокобезопасностью.
     """
-    _sheet_df_cache: dict[tuple[str, str], pd.DataFrame] = {}
-    _dedup_cache: dict[tuple[int, int, int], pd.DataFrame] = {}
-    _num_series_cache: dict[tuple[int, int, str], pd.Series] = {}
-    _str_series_cache: dict[tuple[int, int, str], pd.Series] = {}
-    _month_series_cache: dict[tuple[int, int, str], tuple[pd.Series, pd.Series]] = {}
-    _unique_vals_cache: dict[tuple[int, int, str, int], list[str]] = {}
-    _filter_df_cache: dict[tuple, pd.DataFrame] = {}
-    _render_html_cache: dict[str, tuple[str, str]] = {}
+    _lock = threading.RLock()
+    _sheet_df_cache: OrderedDict = OrderedDict()
+    _dedup_cache: OrderedDict = OrderedDict()
+    _num_series_cache: OrderedDict = OrderedDict()
+    _str_series_cache: OrderedDict = OrderedDict()
+    _month_series_cache: OrderedDict = OrderedDict()
+    _unique_vals_cache: OrderedDict = OrderedDict()
+    _filter_df_cache: OrderedDict = OrderedDict()
+    _render_html_cache: OrderedDict = OrderedDict()
+
+    _MAX_SHEETS = 16
+    _MAX_DEDUP = 16
+    _MAX_SERIES = 64
+    _MAX_UNIQUE = 64
+    _MAX_FILTER_DF = 8
+    _MAX_RENDER_HTML = 24
+
+    @classmethod
+    def _put_lru(cls, cache: OrderedDict, key, value, max_size: int, owner_obj=None):
+        with cls._lock:
+            cache[key] = value
+            cache.move_to_end(key)
+            while len(cache) > max_size:
+                cache.popitem(last=False)
+            if owner_obj is not None:
+                try:
+                    token = value
+                    weakref.finalize(
+                        owner_obj,
+                        cls._safe_evict,
+                        cache,
+                        key,
+                        token,
+                    )
+                except TypeError:
+                    pass
+
+    @classmethod
+    def _safe_evict(cls, cache: OrderedDict, key, expected_val):
+        with cls._lock:
+            cur = cache.get(key)
+            if cur is expected_val:
+                cache.pop(key, None)
 
     @classmethod
     def df_key(cls, df: pd.DataFrame) -> tuple[int, int, int]:
@@ -50,49 +89,61 @@ class DataMemoryCache:
 
     @classmethod
     def invalidate_file(cls, file_name: str = "", sheet_name: str = ""):
-        """Сбрасывает кэш конкретного файла/листа или очищает всё, если аргументы пусты."""
+        """Полностью сбрасывает кэш файла/листа и все производные серии без «осиротевших» записей."""
         f_clean = str(file_name or "").strip()
         s_clean = str(sheet_name or "").strip()
-        
+
         if not f_clean and not s_clean:
             cls.clear_all()
             return
 
-        # Удаляем из кэша конкретный лист
-        cache_key = (f_clean, s_clean)
-        if cache_key in cls._sheet_df_cache:
-            del cls._sheet_df_cache[cache_key]
-        
-        # Также очищаем кэш отфильтрованных датафреймов и HTML-рендеров
-        cls._filter_df_cache.clear()
-        cls._render_html_cache.clear()
+        with cls._lock:
+            to_del = [
+                k for k in list(cls._sheet_df_cache.keys())
+                if (isinstance(k, tuple) and len(k) == 3 and k[1] == f_clean and (not s_clean or k[2] == s_clean))
+                or k == (f_clean, s_clean)
+            ]
+            for k in to_del:
+                cls._sheet_df_cache.pop(k, None)
+
+            # Чистим все производные кэши, чтобы не оставалось битых/осиротевших серий
+            cls._dedup_cache.clear()
+            cls._num_series_cache.clear()
+            cls._str_series_cache.clear()
+            cls._month_series_cache.clear()
+            cls._unique_vals_cache.clear()
+            cls._filter_df_cache.clear()
+            cls._render_html_cache.clear()
         print(f"[DataMemoryCache] Кэш для файла '{f_clean}' (лист: '{s_clean}') сброшен.")
 
     @classmethod
     def clear_all(cls):
-        cls._sheet_df_cache.clear()
-        cls._dedup_cache.clear()
-        cls._num_series_cache.clear()
-        cls._str_series_cache.clear()
-        cls._month_series_cache.clear()
-        cls._unique_vals_cache.clear()
-        cls._filter_df_cache.clear()
-        cls._render_html_cache.clear()
+        with cls._lock:
+            cls._sheet_df_cache.clear()
+            cls._dedup_cache.clear()
+            cls._num_series_cache.clear()
+            cls._str_series_cache.clear()
+            cls._month_series_cache.clear()
+            cls._unique_vals_cache.clear()
+            cls._filter_df_cache.clear()
+            cls._render_html_cache.clear()
 
     @classmethod
     def dedup_df(cls, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or not hasattr(df, "columns"):
             return df
-        key = cls.df_key(df)
-        if key in cls._dedup_cache:
-            return cls._dedup_cache[key]
+        # Если дублей колонок нет — возвращаем исходный df без хранения сильной ссылки в кэше
         if not df.columns.duplicated().any():
-            cls._dedup_cache[key] = df
             return df
+        key = cls.df_key(df)
+        with cls._lock:
+            cached = cls._dedup_cache.get(key)
+            if cached is not None:
+                cls._dedup_cache.move_to_end(key)
+                return cached
         clean_cols = {col: _ensure_series(df[col]) for col in dict.fromkeys(df.columns)}
         res = pd.DataFrame(clean_cols, index=df.index)
-        cls._dedup_cache[key] = res
-        cls._dedup_cache[cls.df_key(res)] = res
+        cls._put_lru(cls._dedup_cache, key, res, cls._MAX_DEDUP, owner_obj=df)
         return res
 
     @classmethod
@@ -102,7 +153,6 @@ class DataMemoryCache:
         if s_clean == "— Авто (первый лист) —":
             s_clean = ""
 
-        # Если файл/лист не заданы в блоке, определяем дефолтный файл и лист из FileManager
         if not f_clean and not s_clean and manager is not None:
             if hasattr(manager, "get_default_file_and_sheet"):
                 try:
@@ -120,24 +170,34 @@ class DataMemoryCache:
                 except Exception:
                     pass
 
-        cache_key = (f_clean, s_clean)
+        mgr_id = id(manager) if manager is not None else 0
+        cache_key = (mgr_id, f_clean, s_clean)
 
-        # 1. Если этот конкретный (файл, лист) уже есть в RAM-кэше — отдаём мгновенно
-        if (f_clean or s_clean) and cache_key in cls._sheet_df_cache:
-            return cls._sheet_df_cache[cache_key]
+        # 1. Проверяем слабую ссылку на загруженный DataFrame (мгновенно, без утечек)
+        if (f_clean or s_clean):
+            with cls._lock:
+                entry = cls._sheet_df_cache.get(cache_key)
+                if entry is not None:
+                    df_ref, dedup_copy = entry
+                    orig = df_ref()
+                    if orig is not None:
+                        cls._sheet_df_cache.move_to_end(cache_key)
+                        return dedup_copy if dedup_copy is not None else orig
+                    cls._sheet_df_cache.pop(cache_key, None)
 
-        # 2. Запрашиваем точный DataFrame у FileManager ровно 1 раз и сохраняем в RAM-кэш
+        # 2. Запрашиваем DataFrame у FileManager и кэшируем через weakref
         if manager is not None and hasattr(manager, "get_dataframe") and (f_clean or s_clean):
             try:
                 loaded_df = manager.get_dataframe(f_clean, s_clean)
                 if loaded_df is not None:
                     deduped = cls.dedup_df(loaded_df)
-                    cls._sheet_df_cache[cache_key] = deduped
+                    entry = (weakref.ref(loaded_df), None if deduped is loaded_df else deduped)
+                    cls._put_lru(cls._sheet_df_cache, cache_key, entry, cls._MAX_SHEETS, owner_obj=loaded_df)
                     return deduped
             except Exception as e:
                 print(f"[DataMemoryCache] Ошибка чтения листа {f_clean} / {s_clean}: {e}")
 
-        # 3. Запасной вариант, если FileManager не вернул таблицу
+        # 3. Запасной вариант
         if fallback_df is not None:
             return cls.dedup_df(fallback_df)
 
@@ -152,38 +212,75 @@ class DataMemoryCache:
 
     @classmethod
     def get_str_series(cls, df: pd.DataFrame, col_name: str) -> pd.Series:
+        key = (id(df), len(df), str(col_name))
+        with cls._lock:
+            cached = cls._str_series_cache.get(key)
+            if cached is not None:
+                cls._str_series_cache.move_to_end(key)
+                return cached
         s = _ensure_series(df[col_name])
-        key = (id(s), len(s), str(col_name))
-        if key not in cls._str_series_cache:
-            cls._str_series_cache[key] = s.fillna("").astype(str).str.strip()
-        return cls._str_series_cache[key]
+        res = s.fillna("").astype(str).str.strip()
+        cls._put_lru(cls._str_series_cache, key, res, cls._MAX_SERIES, owner_obj=df)
+        return res
 
     @classmethod
     def get_unique_values(cls, df: pd.DataFrame, col_name: str, limit: int = 100) -> list[str]:
         if df is None or col_name not in df.columns:
             return []
         key = (id(df), len(df), str(col_name), int(limit))
-        if key not in cls._unique_vals_cache:
-            s = cls.get_str_series(df, col_name)
-            vals = [v for v in s.unique().tolist() if v and v != "nan" and v != "None"][:limit]
-            cls._unique_vals_cache[key] = vals
-        return cls._unique_vals_cache[key]
+        with cls._lock:
+            cached = cls._unique_vals_cache.get(key)
+            if cached is not None:
+                cls._unique_vals_cache.move_to_end(key)
+                return cached
+        s = cls.get_str_series(df, col_name)
+        vals = [v for v in s.unique().tolist() if v and v != "nan" and v != "None"][:limit]
+        cls._put_lru(cls._unique_vals_cache, key, vals, cls._MAX_UNIQUE, owner_obj=df)
+        return vals
+
+    @classmethod
+    def get_filter_payload(cls, key):
+        with cls._lock:
+            val = cls._filter_df_cache.get(key)
+            if val is not None:
+                cls._filter_df_cache.move_to_end(key)
+            return val
+
+    @classmethod
+    def set_filter_payload(cls, key, value, owner_obj=None):
+        cls._put_lru(cls._filter_df_cache, key, value, cls._MAX_FILTER_DF, owner_obj=owner_obj)
+
+    @classmethod
+    def get_render_html(cls, key: str, expected_sig: str) -> str | None:
+        with cls._lock:
+            entry = cls._render_html_cache.get(key)
+            if entry is not None and entry[0] == expected_sig:
+                cls._render_html_cache.move_to_end(key)
+                return entry[1]
+            return None
+
+    @classmethod
+    def set_render_html(cls, key: str, sig: str, html: str, owner_obj=None):
+        cls._put_lru(cls._render_html_cache, key, (sig, html), cls._MAX_RENDER_HTML, owner_obj=owner_obj)
 
 
 def _dedup_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Убирает дубликаты названий столбцов в DataFrame через оперативный кэш (только 1 раз)."""
+    """Убирает дубликаты названий столбцов в DataFrame через оперативный кэш."""
     return DataMemoryCache.dedup_df(df)
 
 
 def _to_num_series(s: pd.Series) -> pd.Series:
-    """Переводит серию в числа только 1 раз и сохраняет результат в оперативной памяти (RAM)."""
+    """Переводит серию в конечные числа (без NaN/Inf) с авто-очисткой кэша."""
     s = _ensure_series(s)
     cache_key = (id(s), len(s), str(getattr(s, "name", "")))
-    if cache_key in DataMemoryCache._num_series_cache:
-        return DataMemoryCache._num_series_cache[cache_key]
+    with DataMemoryCache._lock:
+        cached = DataMemoryCache._num_series_cache.get(cache_key)
+        if cached is not None:
+            DataMemoryCache._num_series_cache.move_to_end(cache_key)
+            return cached
 
     if pd.api.types.is_numeric_dtype(s):
-        res = s.fillna(0)
+        res = s.replace([np.inf, -np.inf], 0).fillna(0)
     else:
         cleaned = (
             s.astype(str)
@@ -191,9 +288,9 @@ def _to_num_series(s: pd.Series) -> pd.Series:
             .str.replace(" ", "", regex=False)
             .str.replace(",", ".", regex=False)
         )
-        res = pd.to_numeric(cleaned, errors="coerce").fillna(0)
+        res = pd.to_numeric(cleaned, errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
 
-    DataMemoryCache._num_series_cache[cache_key] = res
+    DataMemoryCache._put_lru(DataMemoryCache._num_series_cache, cache_key, res, DataMemoryCache._MAX_SERIES, owner_obj=s)
     return res
 
 
@@ -558,10 +655,10 @@ class ParagraphBlock(Block):
             }
 
         matrix = {"ALL": {}}
-        matrix["ALL"]["ALL_MONTHS"] = _calc_cell(work, "Все типы ТС", "Весь период", "_grp")
+        matrix["ALL"]["ALL_MONTHS"] = _calc_cell(work, "Все категории", "Весь период", "_grp")
         for m_name in months_list:
             m_df = work[work["_m_name"] == m_name]
-            matrix["ALL"][m_name] = _calc_cell(m_df, "Все типы ТС", m_name, "_grp")
+            matrix["ALL"][m_name] = _calc_cell(m_df, "Все категории", m_name, "_grp")
 
         top_groups = [g for g in work["_grp"].value_counts().head(50).index.tolist() if g]
         for g_name in top_groups:
@@ -671,8 +768,8 @@ class ParagraphBlock(Block):
                                 String(ctx.abs_diff || '0'),
                                 Number(ctx.raw_count || 0),
                                 Number(ctx.raw_count || 0),
-                                String(ctx.group || 'Все типы ТС'),
-                                String(ctx.group || 'Все типы ТС'),
+                                String(ctx.group || 'Все категории'),
+                                String(ctx.group || 'Все категории'),
                                 String(ctx.month || 'Весь период'),
                                 String(ctx.month || 'Весь период'),
                                 String(ctx.top_name || '—'),
@@ -835,7 +932,7 @@ class DataTableBlock(Block):
     dataframe: object = None
     source_file_name: str = ""
     source_sheet: str = ""
-    title: str = "Реестр путевых листов / Таблица данных"
+    title: str = "Таблица данных"
     max_rows: int = 20
     visible_columns: list[str] | None = None
     preview_limit: int = 0
@@ -868,7 +965,7 @@ class DataTableBlock(Block):
             return self.wrap_layout(self._render_empty())
 
         total_rows = len(df)
-        hard_cap = self.preview_limit if self.preview_limit and self.preview_limit > 0 else 500000
+        hard_cap = self.preview_limit if self.preview_limit and self.preview_limit > 0 else 100000
         truncated = total_rows > hard_cap
 
         # 1. Вычисляем хэш источника данных и настроек блока
@@ -878,13 +975,13 @@ class DataTableBlock(Block):
         block_render_sig = f"{self.id}_{data_hash}_{self.title}_{self.max_rows}_{self.width}_{self.min_height}"
         html_cache_key = f"dt_html_{self.id}"
 
-        cached_html_entry = DataMemoryCache._render_html_cache.get(html_cache_key)
-        if cached_html_entry is not None and cached_html_entry[0] == block_render_sig:
-            return cached_html_entry[1]
+        cached_html = DataMemoryCache.get_render_html(html_cache_key, block_render_sig)
+        if cached_html is not None:
+            return cached_html
 
         # 2. Берём готовый хэш-пакет данных из RAM-кэша или строим его 1 раз
         payload_cache_key = ("dt_hash_payload", data_hash)
-        payload_json = DataMemoryCache._filter_df_cache.get(payload_cache_key)
+        payload_json = DataMemoryCache.get_filter_payload(payload_cache_key)
 
         if payload_json is None:
             work_df = df[cols].head(hard_cap) if truncated else df[cols]
@@ -946,7 +1043,7 @@ class DataTableBlock(Block):
                 },
                 ensure_ascii=False,
             )
-            DataMemoryCache._filter_df_cache[payload_cache_key] = payload_json
+            DataMemoryCache.set_filter_payload(payload_cache_key, payload_json, owner_obj=df)
 
         tbl_id = f"ea-tbl-{self.id}"
         max_rows_val = int(self.max_rows) if self.max_rows is not None else 20
@@ -1069,13 +1166,13 @@ class DataTableBlock(Block):
                                    border-radius: 6px; padding: 5px 12px;
                                    font-size: 12px; cursor: pointer;
                                    font-weight: 600;">
-                        🔍  Найти путевой лист / ТС
+                        🔍  Поиск по таблице
                     </button>
                     <input type="text"
                            class="ea-table-search-input"
                            id="{tbl_id}-inp"
                            data-target="{tbl_id}"
-                           placeholder="Введите госномер (напр. О201ЕР136), марку или месяц..."
+                           placeholder="Поиск по значению, ID, категории или периоду..."
                            style="display:none; flex:1; min-width:220px;
                                   padding:5px 10px; font-size:12px;
                                   border:1px solid #87C800;
@@ -1327,7 +1424,7 @@ class DataTableBlock(Block):
         </script>
         '''
         final_html = self.wrap_layout(inner)
-        DataMemoryCache._render_html_cache[html_cache_key] = (block_render_sig, final_html)
+        DataMemoryCache.set_render_html(html_cache_key, block_render_sig, final_html, owner_obj=df)
         return final_html
 
     def _render_empty(self) -> str:
@@ -1459,6 +1556,72 @@ class PivotMatrixBlock(Block):
             return res_f
         except ZeroDivisionError:
             return 0.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _compile_pivot_formula(formula_str: str, col_names: list[str]):
+        """Компилирует формулу сводной таблицы один раз перед циклом по ячейкам."""
+        if not formula_str or not str(formula_str).strip():
+            return None, ()
+        expr = (
+            str(formula_str)
+            .strip()
+            .replace(",", ".")
+            .replace("−", "-")
+            .replace("–", "-")
+            .replace("×", "*")
+            .replace("÷", "/")
+            .replace(";", ",")
+        )
+        used_toks = []
+        indexed_cols = sorted(enumerate(col_names), key=lambda x: len(str(x[1])), reverse=True)
+        for idx, c_name in indexed_cols:
+            c_clean = str(c_name).strip()
+            if c_clean:
+                token = f"__COL_{idx}__"
+                if f"[{c_clean}]" in expr or c_clean in expr:
+                    expr = expr.replace(f"[{c_clean}]", token).replace(c_clean, token)
+                    used_toks.append((idx, token))
+        expr = re.sub(r"\b(if|IF|если|ЕСЛИ)\s*\(", "_if_call(", expr)
+        try:
+            return compile(expr, "<pivot_formula>", "eval"), tuple(used_toks)
+        except Exception:
+            return None, ()
+
+    @staticmethod
+    def _eval_compiled_pivot_formula(code_obj, used_toks: tuple, vals_tuple) -> float:
+        if code_obj is None:
+            return 0.0
+
+        def _if_fn(cond, t_val, f_val=0.0):
+            return float(t_val) if bool(cond) else float(f_val)
+
+        env = {
+            "__builtins__": {},
+            "abs": abs, "ABS": abs,
+            "round": round, "ROUND": round,
+            "min": min, "MIN": min,
+            "max": max, "MAX": max,
+            "sqrt": math.sqrt, "SQRT": math.sqrt,
+            "if": _if_fn, "IF": _if_fn,
+            "если": _if_fn, "ЕСЛИ": _if_fn,
+            "_if_call": _if_fn,
+        }
+        en_l = ("A", "B", "C", "D", "E", "F", "G", "H")
+        ru_l = ("А", "Б", "В", "Г", "Д", "Е", "Ж", "З")
+        for idx, val in enumerate(vals_tuple):
+            f_val = 0.0 if (val is None or (isinstance(val, float) and math.isnan(val))) else float(val)
+            env[f"C{idx + 1}"] = env[f"c{idx + 1}"] = f_val
+            if idx < 8:
+                env[en_l[idx]] = env[en_l[idx].lower()] = f_val
+                env[ru_l[idx]] = env[ru_l[idx].lower()] = f_val
+        for idx, tok in used_toks:
+            val = vals_tuple[idx] if idx < len(vals_tuple) else 0.0
+            env[tok] = 0.0 if (val is None or (isinstance(val, float) and math.isnan(val))) else float(val)
+        try:
+            res = float(eval(code_obj, {"__builtins__": {}}, env))
+            return 0.0 if (math.isnan(res) or math.isinf(res)) else res
         except Exception:
             return 0.0
 
@@ -1649,26 +1812,56 @@ class PivotMatrixBlock(Block):
         total_metrics_per_group = len(all_metric_specs)
 
         try:
+            def _df_to_map(gdf) -> dict:
+                if gdf is None or len(gdf) == 0:
+                    return {}
+                return dict(zip(gdf.index.tolist(), gdf.itertuples(index=False, name=None)))
+
             g1_tot = work.groupby("_r1", sort=False)[num_keys].agg(agg_fn)
             g1_tot = g1_tot.sort_values(by=num_keys[0], ascending=False).head(max_r)
             top_r1_list = g1_tot.index.tolist()
 
-            g1_col = work.groupby(["_r1", "_col"], sort=False)[num_keys].agg(agg_fn) if has_col_group else None
+            # Фильтруем work по топ-группам Уровня 1 ДО тяжёлых группировок Уровней 2 и 3
+            work_top = work[work["_r1"].isin(set(top_r1_list))]
+
+            d1_tot = _df_to_map(g1_tot)
+            d1_col = _df_to_map(work_top.groupby(["_r1", "_col"], sort=False)[num_keys].agg(agg_fn)) if has_col_group else {}
 
             if lvl2_col:
-                g2_tot = work.groupby(["_r1", "_r2"], sort=False)[num_keys].agg(agg_fn).sort_index()
-                g2_col = work.groupby(["_r1", "_r2", "_col"], sort=False)[num_keys].agg(agg_fn).sort_index() if has_col_group else None
+                d2_tot = _df_to_map(work_top.groupby(["_r1", "_r2"], sort=False)[num_keys].agg(agg_fn))
+                d2_col = _df_to_map(work_top.groupby(["_r1", "_r2", "_col"], sort=False)[num_keys].agg(agg_fn)) if has_col_group else {}
             else:
-                g2_tot, g2_col = None, None
+                d2_tot, d2_col = {}, {}
 
             if lvl2_col and lvl3_col:
-                g3_tot = work.groupby(["_r1", "_r2", "_r3"], sort=False)[num_keys].agg(agg_fn).sort_index()
-                g3_col = work.groupby(["_r1", "_r2", "_r3", "_col"], sort=False)[num_keys].agg(agg_fn).sort_index() if has_col_group else None
+                d3_tot = _df_to_map(work_top.groupby(["_r1", "_r2", "_r3"], sort=False)[num_keys].agg(agg_fn))
+                d3_col = _df_to_map(work_top.groupby(["_r1", "_r2", "_r3", "_col"], sort=False)[num_keys].agg(agg_fn)) if has_col_group else {}
             else:
-                g3_tot, g3_col = None, None
+                d3_tot, d3_col = {}, {}
 
-            gt_tot = work[num_keys].agg(agg_fn)
-            gt_col = work.groupby("_col", sort=False)[num_keys].agg(agg_fn) if has_col_group else None
+            gt_tot_vals = tuple(
+                0.0 if pd.isna(v) else float(v) for v in work[num_keys].agg(agg_fn).tolist()
+            )
+            gt_col_map = _df_to_map(work.groupby("_col", sort=False)[num_keys].agg(agg_fn)) if has_col_group else {}
+
+            # Строим списки дочерних узлов в O(N) вместо сотен .loc[]
+            l2_by_l1: dict[str, list[tuple[str, float]]] = {}
+            for (r1_k, r2_k), vals in d2_tot.items():
+                l2_by_l1.setdefault(r1_k, []).append((r2_k, 0.0 if pd.isna(vals[0]) else float(vals[0])))
+            for lst in l2_by_l1.values():
+                lst.sort(key=lambda x: x[1], reverse=True)
+
+            l3_by_l12: dict[tuple[str, str], list[tuple[str, float]]] = {}
+            for (r1_k, r2_k, r3_k), vals in d3_tot.items():
+                l3_by_l12.setdefault((r1_k, r2_k), []).append((r3_k, 0.0 if pd.isna(vals[0]) else float(vals[0])))
+            for lst in l3_by_l12.values():
+                lst.sort(key=lambda x: x[1], reverse=True)
+
+            compiled_calcs = [
+                (cc["name"], cc["is_pct"], *self._compile_pivot_formula(cc["formula"], val_cols))
+                for cc in active_calc_cols
+            ]
+            zeros_tuple = tuple(0.0 for _ in num_keys)
 
             hier_parts = [lvl1_col]
             if lvl2_col:
@@ -1710,80 +1903,68 @@ class PivotMatrixBlock(Block):
                         ths.append(f"<th>{_escape(m_title)} ({agg_label})</th>")
                 thead_rows.append("<tr>" + "".join(ths) + "</tr>")
 
-            def _render_metric_group_tds(base_vals: list[float], base_td_cls: str) -> list[str]:
+            def _render_metric_group_tds(base_vals: tuple, base_td_cls: str) -> list[str]:
                 group_tds = []
-                for idx_v, (vc_name, v_num) in enumerate(zip(val_cols, base_vals)):
+                cls_attr = f' class="{base_td_cls}"' if base_td_cls else ""
+                calc_cls = f"{base_td_cls} ea-piv-calc-td".strip()
+                calc_cls_attr = f' class="{calc_cls}"' if calc_cls else ""
+
+                for vc_name, v_raw in zip(val_cols, base_vals):
+                    v_num = 0.0 if (v_raw is None or (isinstance(v_raw, float) and math.isnan(v_raw))) else float(v_raw)
                     c_style = _cell_color_style(v_num, vc_name, False)
-                    cls_attr = f' class="{base_td_cls}"' if base_td_cls else ""
                     group_tds.append(f"<td{cls_attr}{c_style}>{_fmt_num(v_num)}</td>")
 
-                for cc in active_calc_cols:
-                    c_val = self._eval_pivot_formula(cc["formula"], base_vals, val_cols)
-                    c_style = _cell_color_style(c_val, cc["name"], True)
-                    calc_cls = f"{base_td_cls} ea-piv-calc-td".strip()
-                    cls_attr = f' class="{calc_cls}"' if calc_cls else ""
-                    group_tds.append(f"<td{cls_attr}{c_style}>{_fmt_num(c_val, is_pct=cc['is_pct'], force_float=True)}</td>")
+                for c_name, is_pct, code_obj, used_toks in compiled_calcs:
+                    c_val = self._eval_compiled_pivot_formula(code_obj, used_toks, base_vals)
+                    c_style = _cell_color_style(c_val, c_name, True)
+                    group_tds.append(f"<td{calc_cls_attr}{c_style}>{_fmt_num(c_val, is_pct=is_pct, force_float=True)}</td>")
                 return group_tds
 
-            def _build_value_cells(col_df, tot_series, idx_tuple, is_total_row: bool = False) -> str:
+            def _build_value_cells(col_map: dict, tot_vals: tuple, idx_tuple: tuple, is_total_row: bool = False) -> str:
                 tds = []
                 base_cls = "ea-piv-tot-cell" if is_total_row else ""
                 if has_col_group:
                     for ck in col_keys:
                         lookup = (*idx_tuple, ck) if idx_tuple else ck
-                        base_vals = []
-                        for k in num_keys:
-                            try:
-                                v = float(col_df.loc[lookup, k])
-                            except KeyError:
-                                v = 0.0
-                            base_vals.append(v)
+                        base_vals = col_map.get(lookup, zeros_tuple)
                         tds.extend(_render_metric_group_tds(base_vals, base_cls))
                     if self.show_totals:
-                        tot_vals = []
-                        for k in num_keys:
-                            v = float(tot_series[k] if idx_tuple == () else tot_series.loc[idx_tuple if len(idx_tuple) > 1 else idx_tuple[0], k])
-                            tot_vals.append(v)
                         tds.extend(_render_metric_group_tds(tot_vals, "ea-piv-tot-col"))
                 else:
-                    tot_vals = []
-                    for k in num_keys:
-                        v = tot_series[k] if idx_tuple == () else tot_series.loc[idx_tuple if len(idx_tuple) > 1 else idx_tuple[0], k]
-                        tot_vals.append(v)
                     tds.extend(_render_metric_group_tds(tot_vals, base_cls))
                 return "".join(tds)
 
             tbody_rows = []
+            max_l3_total = 8000  # защита браузера от раздувания DOM при сотнях тысяч листьев
+            l3_rendered = 0
+            total_cols_span = 1 + (len(col_keys) + (1 if self.show_totals else 0)) * total_metrics_per_group if has_col_group else (1 + total_metrics_per_group)
+
             for i1, r1_val in enumerate(top_r1_list):
                 node1_id = f"{tbl_uid}_l1_{i1}"
                 safe_r1 = _escape(str(r1_val))
-                r2_sub = g2_tot.loc[r1_val].sort_values(by=num_keys[0], ascending=False) if (g2_tot is not None and r1_val in g2_tot.index) else None
-                has_l2 = r2_sub is not None and len(r2_sub) > 0
+                r2_list = l2_by_l1.get(r1_val, [])
+                has_l2 = len(r2_list) > 0
 
                 if has_l2:
                     row1_Attr = (
                         f'class="ea-piv-row-l1 ea-piv-expandable" data-level="1" data-node="{node1_id}" '
                         f'data-r1="{safe_r1}" onclick="window.toggleEaPivotRow(\'{tbl_uid}\', \'{node1_id}\', 1)"'
                     )
-                    badge1 = f'<span class="ea-piv-cnt">{len(r2_sub)}</span>'
+                    badge1 = f'<span class="ea-piv-cnt">{len(r2_list)}</span>'
                     label1_html = f'<span class="ea-piv-caret" id="caret_{node1_id}">▶</span> {safe_r1} {badge1}'
                 else:
                     row1_Attr = f'class="ea-piv-row-l1" data-level="1" data-node="{node1_id}" data-r1="{safe_r1}"'
                     label1_html = safe_r1
 
-                cells1 = _build_value_cells(g1_col, g1_tot, (r1_val,))
+                cells1 = _build_value_cells(d1_col, d1_tot.get(r1_val, zeros_tuple), (r1_val,))
                 tbody_rows.append(f"<tr {row1_Attr}><th>{label1_html}</th>{cells1}</tr>")
 
                 if has_l2:
-                    for i2, r2_val in enumerate(r2_sub.index.tolist()):
+                    for i2, (r2_val, _) in enumerate(r2_list):
                         node2_id = f"{node1_id}_l2_{i2}"
                         safe_r2 = _escape(str(r2_val))
-                        r3_sub = (
-                            g3_tot.loc[(r1_val, r2_val)].sort_values(by=num_keys[0], ascending=False)
-                            if (g3_tot is not None and (r1_val, r2_val) in g3_tot.index)
-                            else None
-                        )
-                        has_l3 = r3_sub is not None and len(r3_sub) > 0
+                        r3_list = l3_by_l12.get((r1_val, r2_val), [])
+                        has_l3 = len(r3_list) > 0 and l3_rendered < max_l3_total
 
                         if has_l3:
                             row2_Attr = (
@@ -1791,7 +1972,7 @@ class PivotMatrixBlock(Block):
                                 f'data-node="{node2_id}" data-r1="{safe_r1}" data-r2="{safe_r2}" '
                                 f'style="display:none;" onclick="window.toggleEaPivotRow(\'{tbl_uid}\', \'{node2_id}\', 2)"'
                             )
-                            badge2 = f'<span class="ea-piv-cnt">{len(r3_sub)}</span>'
+                            badge2 = f'<span class="ea-piv-cnt">{len(r3_list)}</span>'
                             label2_html = f'<span class="ea-piv-caret" id="caret_{node2_id}">▶</span> {safe_r2} {badge2}'
                         else:
                             row2_Attr = (
@@ -1800,25 +1981,37 @@ class PivotMatrixBlock(Block):
                             )
                             label2_html = f'<span style="color:#64748b; margin-right:6px;">•</span>{safe_r2}'
 
-                        cells2 = _build_value_cells(g2_col, g2_tot, (r1_val, r2_val))
+                        cells2 = _build_value_cells(d2_col, d2_tot.get((r1_val, r2_val), zeros_tuple), (r1_val, r2_val))
                         tbody_rows.append(f"<tr {row2_Attr}><th class=\"ea-piv-th-l2\">{label2_html}</th>{cells2}</tr>")
 
                         if has_l3:
-                            for r3_val in r3_sub.index.tolist():
+                            shown_in_l2 = 0
+                            for r3_val, _ in r3_list:
+                                if l3_rendered >= max_l3_total:
+                                    break
+                                l3_rendered += 1
+                                shown_in_l2 += 1
                                 safe_r3 = _escape(str(r3_val))
                                 js_r3 = safe_r3.replace("\\", "\\\\").replace("'", "\\'")
                                 row3_Attr = (
                                     f'class="ea-piv-row-l3 ea-piv-clickable-leaf" data-level="3" data-parent="{node2_id}" '
                                     f'data-root="{node1_id}" data-r1="{safe_r1}" data-r2="{safe_r2}" data-r3="{safe_r3}" '
-                                    f'style="display:none;" title="Нажмите, чтобы отфильтровать путевые листы по {safe_r3}" '
+                                    f'style="display:none;" title="Нажмите, чтобы отфильтровать таблицу по «{safe_r3}»" '
                                     f'onclick="window.selectEaPivotLeaf(\'{tbl_uid}\', \'{js_r3}\', this)"'
                                 )
-                                label3_html = f'<span style="color:#94a3b8; margin-right:6px;">🚗</span>{safe_r3}'
-                                cells3 = _build_value_cells(g3_col, g3_tot, (r1_val, r2_val, r3_val))
+                                label3_html = f'<span style="color:#94a3b8; margin-right:6px;">🏷</span>{safe_r3}'
+                                cells3 = _build_value_cells(d3_col, d3_tot.get((r1_val, r2_val, r3_val), zeros_tuple), (r1_val, r2_val, r3_val))
                                 tbody_rows.append(f"<tr {row3_Attr}><th class=\"ea-piv-th-l3\">{label3_html}</th>{cells3}</tr>")
+                            if shown_in_l2 < len(r3_list):
+                                hidden_cnt = len(r3_list) - shown_in_l2
+                                tbody_rows.append(
+                                    f'<tr class="ea-piv-row-l3" data-level="3" data-parent="{node2_id}" data-root="{node1_id}" style="display:none;">'
+                                    f'<td colspan="{total_cols_span}" style="text-align:left; padding-left:52px; color:#64748b; font-style:italic;">'
+                                    f'… скрыто ещё {hidden_cnt:,} позиций для защиты производительности браузера</td></tr>'
+                                )
 
             if self.show_totals:
-                tot_cells = _build_value_cells(gt_col, gt_tot, (), is_total_row=True)
+                tot_cells = _build_value_cells(gt_col_map, gt_tot_vals, (), is_total_row=True)
                 tbody_rows.append(f'<tr class="ea-piv-grand-total"><th>Итого</th>{tot_cells}</tr>')
 
             tbl_classes = ["ea-pivot-table"]
@@ -1834,6 +2027,7 @@ class PivotMatrixBlock(Block):
                 f'</table>'
             )
         except Exception as e:
+
             import traceback
             traceback.print_exc()
             html_table = f"<p style='color:red;'>Ошибка расчета сводной матрицы: {e}</p>"
@@ -2097,794 +2291,7 @@ class PivotMatrixBlock(Block):
             search_box_html = f'''
             <div style="display:flex; align-items:center; gap:4px;">
                 <input type="text" id="{tbl_uid}_search_inp"
-                       placeholder="🔍 Госномер (А999АА999), модель или тип..."
-                       oninput="window.filterEaPivot('{tbl_uid}', this.value)"
-                       style="padding:4px 10px; font-size:12px; min-width:240px; border:1px solid #87C800;
-                              border-radius:6px; outline:none; background:#ffffff; color:#1e293b;" />
-                <button type="button" id="{tbl_uid}_search_clear"
-                        onclick="window.clearEaPivotSearch('{tbl_uid}')"
-                        style="display:none; padding:4px 8px; font-size:11.5px; font-weight:700; border:1px solid #fecdd3;
-                               border-radius:6px; background:#fff1f2; color:#e11d48; cursor:pointer;">
-                    ✕
-                </button>
-            </div>
-            '''
-
-        expand_btns_html = ""
-        if lvl2_col:
-            expand_btns_html = f'''
-            <button type="button" onclick="window.expandAllEaPivot('{tbl_uid}', true)"
-                    style="padding:4px 10px; font-size:11.5px; font-weight:600; border:1px solid #cbd5e1; border-radius:6px; background:#f8fafc; cursor:pointer; color:#334155;">
-                ➕ Развернуть все
-            </button>
-            <button type="button" onclick="window.expandAllEaPivot('{tbl_uid}', false)"
-                    style="padding:4px 10px; font-size:11.5px; font-weight:600; border:1px solid #cbd5e1; border-radius:6px; background:#f8fafc; cursor:pointer; color:#334155;">
-                ➖ Свернуть все
-            </button>
-            '''
-
-        controls_btns = f'''
-        <div style="display:flex; align-items:center; flex-wrap:wrap; gap:6px; flex-shrink:0;">
-            {search_box_html}
-            {expand_btns_html}
-        </div>
-        '''
-
-        inner = f'''
-        <div class="block" style="width:100%;">
-            <div class="block-card" style="width:100%; padding: 16px; overflow: hidden; background: #ffffff; box-sizing: border-box;">
-                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom: 12px; border-bottom: 2px solid #87C800; padding-bottom: 8px;">
-                    <div style="font-weight: 700; font-size: 14px; color: #003F0B; min-width: 200px; flex: 1;">
-                        {_escape(self.title)} ({_escape(hier_header_title)}{_escape(col_sub)} → {_escape(vals_title)})
-                    </div>
-                    {controls_btns}
-                </div>
-                {style_and_js}
-                <div class="ea-piv-scroll-wrap">
-                    {html_table}
-                </div>
-            </div>
-        </div>
-        '''
-        return self.wrap_layout(inner)
-    
-# ============================================================
-# Сводная матрица (Pivot Matrix) с мульти-столбцами, формулами, поиском и Drill-Down
-# ============================================================
-@dataclass
-class PivotMatrixBlock(Block):
-    type: str = "pivot_matrix"
-    dataframe: object = None
-    source_file_name: str = ""
-    source_sheet: str = ""
-    title: str = "Сводная матрица"
-    row_group_col: str = ""
-    row_level2_col: str = ""
-    row_level3_col: str = ""
-    col_group_col: str = ""
-    value_col: str = ""
-    agg_func: str = "sum"
-    show_totals: bool = True
-    top_n: int = 30
-    color_calc_enabled: bool = False
-    color_calc_scope: str = "calc_and_dev"
-    neg_color: str = "#16a34a"
-    pos_color: str = "#dc2626"
-    color_calc_bg: bool = True
-    sticky_header: bool = True
-    sticky_first_col: bool = True
-    max_table_height: int = 520
-    show_search: bool = True
-    target_table: str = ""
-    value_cols: list[str] = field(default_factory=list)
-    calc_cols: list[dict] = field(default_factory=list)
-
-    @staticmethod
-    def _eval_pivot_formula(formula_str: str, vals_list: list[float], col_names: list[str]) -> float:
-        """Вычисляет математическую формулу для ячейки сводной таблицы по агрегированным значениям столбцов."""
-        import math
-        if not formula_str or not str(formula_str).strip():
-            return 0.0
-
-        expr = (
-            str(formula_str)
-            .strip()
-            .replace(",", ".")
-            .replace("−", "-")
-            .replace("–", "-")
-            .replace("×", "*")
-            .replace("÷", "/")
-            .replace(";", ",")
-        )
-
-        def _if_fn(cond, t_val, f_val=0.0):
-            return float(t_val) if bool(cond) else float(f_val)
-
-        env = {
-            "__builtins__": {},
-            "abs": abs,
-            "ABS": abs,
-            "round": round,
-            "ROUND": round,
-            "min": min,
-            "MIN": min,
-            "max": max,
-            "MAX": max,
-            "sqrt": math.sqrt,
-            "SQRT": math.sqrt,
-            "if": _if_fn,
-            "IF": _if_fn,
-            "если": _if_fn,
-            "ЕСЛИ": _if_fn,
-        }
-
-        en_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
-        ru_letters = ["А", "Б", "В", "Г", "Д", "Е", "Ж", "З"]
-
-        for idx, val in enumerate(vals_list):
-            f_val = float(val) if not pd.isna(val) else 0.0
-            env[f"C{idx + 1}"] = f_val
-            env[f"c{idx + 1}"] = f_val
-            if idx < len(en_letters):
-                env[en_letters[idx]] = f_val
-                env[en_letters[idx].lower()] = f_val
-            if idx < len(ru_letters):
-                env[ru_letters[idx]] = f_val
-                env[ru_letters[idx].lower()] = f_val
-
-        indexed_cols = sorted(enumerate(col_names), key=lambda x: len(str(x[1])), reverse=True)
-        for idx, c_name in indexed_cols:
-            c_clean = str(c_name).strip()
-            if c_clean:
-                token = f"__COL_{idx}__"
-                f_val = float(vals_list[idx]) if idx < len(vals_list) and not pd.isna(vals_list[idx]) else 0.0
-                env[token] = f_val
-                expr = expr.replace(f"[{c_clean}]", token).replace(c_clean, token)
-
-        expr = re.sub(r"\b(if|IF|если|ЕСЛИ)\s*\(", "_if_call(", expr)
-        env["_if_call"] = _if_fn
-
-        try:
-            res = eval(expr, {"__builtins__": {}}, env)
-            res_f = float(res)
-            if math.isnan(res_f) or math.isinf(res_f):
-                return 0.0
-            return res_f
-        except ZeroDivisionError:
-            return 0.0
-        except Exception:
-            return 0.0
-
-    @staticmethod
-    def _hex_to_rgba(hex_color: str, alpha: float = 0.12) -> str:
-        h = str(hex_color or "").strip().lstrip("#")
-        if len(h) == 3:
-            h = "".join(c * 2 for c in h)
-        if len(h) != 6:
-            return "transparent"
-        try:
-            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-            return f"rgba({r}, {g}, {b}, {alpha:.2f})"
-        except Exception:
-            return "transparent"
-
-    def render(self) -> str:
-        report_obj, own_cfg = _find_report_and_config(self)
-        if report_obj is not None:
-            self._report_ref = report_obj
-        for k, v in own_cfg.items():
-            if hasattr(self, k) and k not in ("id", "type", "dataframe", "width", "margin_top", "margin_bottom", "min_height"):
-                setattr(self, k, v)
-
-        manager = getattr(self, "_file_manager", None)
-        if not manager and report_obj and hasattr(report_obj, "file_manager"):
-            manager = report_obj.file_manager
-
-        df = DataMemoryCache.get_dataframe(
-            manager, self.source_file_name, self.source_sheet or own_cfg.get("source_file", ""), fallback_df=self.dataframe
-        )
-        if df is None or len(df) == 0:
-            return self.wrap_layout('<div class="block-card" style="padding:40px; text-align:center; color:#888;">Нет данных для сводной матрицы</div>')
-
-        cols = [str(c) for c in df.columns]
-        num_cols = [str(c) for c in df.select_dtypes(include="number").columns]
-        str_cols = [c for c in cols if c not in num_cols]
-
-        if not self.row_group_col or self.row_group_col not in df.columns:
-            for cand in str_cols:
-                if any(w in cand.lower() for w in ("тип", "групп", "категор", "марк")):
-                    self.row_group_col = cand
-                    break
-            if not self.row_group_col:
-                self.row_group_col = str_cols[0] if str_cols else cols[0]
-
-        lvl1_col = self.row_group_col
-
-        lvl2_col = ""
-        if self.row_level2_col == "__NONE__":
-            lvl2_col = ""
-        elif self.row_level2_col and self.row_level2_col in df.columns and self.row_level2_col != lvl1_col:
-            lvl2_col = self.row_level2_col
-        else:
-            for cand in str_cols:
-                if cand != lvl1_col and cand != self.col_group_col:
-                    if any(w in cand.lower() for w in ("марк", "модел", "авто", "наимен")):
-                        lvl2_col = cand
-                        break
-
-        lvl3_col = ""
-        if self.row_level3_col == "__NONE__":
-            lvl3_col = ""
-        elif self.row_level3_col and self.row_level3_col in df.columns and self.row_level3_col not in (lvl1_col, lvl2_col):
-            lvl3_col = self.row_level3_col
-        else:
-            for cand in cols:
-                if cand not in (lvl1_col, lvl2_col, self.col_group_col):
-                    if any(w in cand.lower() for w in ("гос", "номер", "грз", "гараж", "вин", "vin")):
-                        lvl3_col = cand
-                        break
-
-        val_cols: list[str] = []
-        if self.value_col and self.value_col in df.columns:
-            val_cols.append(self.value_col)
-
-        raw_extra = self.value_cols or own_cfg.get("value_cols", [])
-        if isinstance(raw_extra, str):
-            raw_extra = [x.strip() for x in raw_extra.split(",") if x.strip()]
-        for vc in raw_extra:
-            if vc in df.columns and vc not in val_cols:
-                val_cols.append(vc)
-
-        if not val_cols:
-            for cand in cols:
-                if any(w in cand.lower() for w in ("факт", "расход", "сумм", "норм")):
-                    val_cols.append(cand)
-                    break
-            if not val_cols:
-                val_cols = [num_cols[0] if num_cols else cols[-1]]
-
-        self.value_col = val_cols[0]
-
-        raw_calcs = self.calc_cols if isinstance(self.calc_cols, list) else (own_cfg.get("calc_cols") or [])
-        active_calc_cols: list[dict] = []
-        for item in raw_calcs:
-            if isinstance(item, dict) and str(item.get("formula", "")).strip():
-                active_calc_cols.append({
-                    "name": str(item.get("name") or item.get("formula") or "Расчёт").strip(),
-                    "formula": str(item.get("formula")).strip(),
-                    "is_pct": bool(item.get("is_pct", False)),
-                })
-
-        work = df.copy()
-        work["_r1"] = work[lvl1_col].fillna("—").astype(str).str.strip().replace("", "—")
-        if lvl2_col:
-            work["_r2"] = work[lvl2_col].fillna("—").astype(str).str.strip().replace("", "—")
-        if lvl3_col:
-            work["_r3"] = work[lvl3_col].fillna("—").astype(str).str.strip().replace("", "—")
-
-        num_keys: list[str] = []
-        for idx_v, vc in enumerate(val_cols):
-            k = f"_v{idx_v}"
-            work[k] = _to_num_series(work[vc]) if self.agg_func != "count" else 1.0
-            num_keys.append(k)
-
-        agg_map = {"sum": "sum", "mean": "mean", "count": "count", "min": "min", "max": "max"}
-        agg_fn = agg_map.get(self.agg_func, "sum")
-        agg_label = {"sum": "Сумма", "mean": "Среднее", "count": "Кол-во", "min": "Мин", "max": "Макс"}.get(agg_fn, "Итог")
-
-        has_col_group = bool(self.col_group_col and self.col_group_col in work.columns and self.col_group_col != lvl1_col)
-        col_keys: list[str] = []
-        if has_col_group:
-            m_names, _ = _extract_month_info(work[self.col_group_col])
-            if (m_names != "").any():
-                work["_col"] = m_names.replace("", "—")
-                present_m = set(work["_col"].unique())
-                ordered_m = [m for m in _RU_MONTHS_ORDER if m in present_m]
-                other_m = [c for c in work["_col"].unique() if c not in ordered_m]
-                col_keys = ordered_m + other_m
-            else:
-                work["_col"] = work[self.col_group_col].fillna("—").astype(str).str.strip().replace("", "—")
-                col_keys = list(dict.fromkeys(work["_col"].tolist()))
-
-        def _fmt_num(val, is_pct: bool = False, force_float: bool = False) -> str:
-            if pd.isna(val):
-                return "0.00%" if is_pct else "0.00"
-            v = float(val)
-            if is_pct:
-                return f"{v:+,.2f}%".replace(",", " ")
-            if self.agg_func == "count" and not force_float:
-                return f"{int(round(v)):,}".replace(",", " ")
-            return f"{v:,.2f}".replace(",", " ")
-
-        def _should_color_col(col_title: str, is_calc_col: bool) -> bool:
-            if not self.color_calc_enabled:
-                return False
-            scope = str(self.color_calc_scope or "calc_and_dev")
-            if scope == "all_cols":
-                return True
-            if is_calc_col:
-                return True
-            if scope == "calc_and_dev":
-                low_t = str(col_title).lower()
-                return any(w in low_t for w in ("откл", "разн", "дельт", "эконом", "перерасх", "баланс", "diff", "%"))
-            return False
-
-        neg_fg = str(self.neg_color or "#16a34a")
-        pos_fg = str(self.pos_color or "#dc2626")
-        neg_bg = self._hex_to_rgba(neg_fg, 0.11) if self.color_calc_bg else "transparent"
-        pos_bg = self._hex_to_rgba(pos_fg, 0.11) if self.color_calc_bg else "transparent"
-
-        def _cell_color_style(val: float, col_title: str, is_calc_col: bool) -> str:
-            if not _should_color_col(col_title, is_calc_col):
-                return ""
-            if val < -1e-9:
-                bg_part = f" background-color:{neg_bg} !important;" if self.color_calc_bg else ""
-                return f' style="color:{neg_fg} !important; font-weight:700;{bg_part}"'
-            if val > 1e-9:
-                bg_part = f" background-color:{pos_bg} !important;" if self.color_calc_bg else ""
-                return f' style="color:{pos_fg} !important; font-weight:700;{bg_part}"'
-            return ""
-
-        tbl_uid = f"ea_piv_{self.id}"
-        max_r = max(5, int(self.top_n or 30))
-        target_tbl_attr = _escape(str(self.target_table or "__ALL__"))
-
-        all_metric_specs: list[tuple[str, bool, object]] = []
-        for vc, nk in zip(val_cols, num_keys):
-            all_metric_specs.append((vc, False, nk))
-        for cc in active_calc_cols:
-            all_metric_specs.append((cc["name"], True, cc))
-
-        total_metrics_per_group = len(all_metric_specs)
-
-        try:
-            g1_tot = work.groupby("_r1", sort=False)[num_keys].agg(agg_fn)
-            g1_tot = g1_tot.sort_values(by=num_keys[0], ascending=False).head(max_r)
-            top_r1_list = g1_tot.index.tolist()
-
-            g1_col = work.groupby(["_r1", "_col"], sort=False)[num_keys].agg(agg_fn) if has_col_group else None
-
-            if lvl2_col:
-                g2_tot = work.groupby(["_r1", "_r2"], sort=False)[num_keys].agg(agg_fn)
-                g2_col = work.groupby(["_r1", "_r2", "_col"], sort=False)[num_keys].agg(agg_fn) if has_col_group else None
-            else:
-                g2_tot, g2_col = None, None
-
-            if lvl2_col and lvl3_col:
-                g3_tot = work.groupby(["_r1", "_r2", "_r3"], sort=False)[num_keys].agg(agg_fn)
-                g3_col = work.groupby(["_r1", "_r2", "_r3", "_col"], sort=False)[num_keys].agg(agg_fn) if has_col_group else None
-            else:
-                g3_tot, g3_col = None, None
-
-            gt_tot = work[num_keys].agg(agg_fn)
-            gt_col = work.groupby("_col", sort=False)[num_keys].agg(agg_fn) if has_col_group else None
-
-            hier_parts = [lvl1_col]
-            if lvl2_col:
-                hier_parts.append(lvl2_col)
-            if lvl2_col and lvl3_col:
-                hier_parts.append(lvl3_col)
-            hier_header_title = " → ".join(hier_parts)
-
-            thead_rows = []
-            if has_col_group:
-                if total_metrics_per_group == 1:
-                    ths = [f'<th class="ea-piv-corner-th" style="text-align:left; min-width:220px;">{_escape(hier_header_title)}</th>']
-                    for ck in col_keys:
-                        ths.append(f"<th>{_escape(str(ck))}</th>")
-                    if self.show_totals:
-                        ths.append('<th class="ea-piv-tot-hdr">Итого</th>')
-                    thead_rows.append("<tr>" + "".join(ths) + "</tr>")
-                else:
-                    top_ths = [f'<th rowspan="2" class="ea-piv-corner-th" style="text-align:left; min-width:220px;">{_escape(hier_header_title)}</th>']
-                    sub_ths = []
-                    for ck in col_keys:
-                        top_ths.append(f'<th colspan="{total_metrics_per_group}">{_escape(str(ck))}</th>')
-                        for m_title, is_c, _ in all_metric_specs:
-                            calc_badge = " 🧮" if is_c else ""
-                            sub_ths.append(f'<th class="ea-piv-sub-th">{_escape(m_title)}{calc_badge}</th>')
-                    if self.show_totals:
-                        top_ths.append(f'<th colspan="{total_metrics_per_group}" class="ea-piv-tot-hdr">Итого</th>')
-                        for m_title, is_c, _ in all_metric_specs:
-                            calc_badge = " 🧮" if is_c else ""
-                            sub_ths.append(f'<th class="ea-piv-sub-th ea-piv-tot-hdr">{_escape(m_title)}{calc_badge}</th>')
-                    thead_rows.append("<tr>" + "".join(top_ths) + "</tr>")
-                    thead_rows.append("<tr>" + "".join(sub_ths) + "</tr>")
-            else:
-                ths = [f'<th class="ea-piv-corner-th" style="text-align:left; min-width:220px;">{_escape(hier_header_title)}</th>']
-                for m_title, is_c, _ in all_metric_specs:
-                    if is_c:
-                        ths.append(f'<th>{_escape(m_title)} 🧮</th>')
-                    else:
-                        ths.append(f"<th>{_escape(m_title)} ({agg_label})</th>")
-                thead_rows.append("<tr>" + "".join(ths) + "</tr>")
-
-            def _render_metric_group_tds(base_vals: list[float], base_td_cls: str) -> list[str]:
-                group_tds = []
-                for idx_v, (vc_name, v_num) in enumerate(zip(val_cols, base_vals)):
-                    c_style = _cell_color_style(v_num, vc_name, False)
-                    cls_attr = f' class="{base_td_cls}"' if base_td_cls else ""
-                    group_tds.append(f"<td{cls_attr}{c_style}>{_fmt_num(v_num)}</td>")
-
-                for cc in active_calc_cols:
-                    c_val = self._eval_pivot_formula(cc["formula"], base_vals, val_cols)
-                    c_style = _cell_color_style(c_val, cc["name"], True)
-                    calc_cls = f"{base_td_cls} ea-piv-calc-td".strip()
-                    cls_attr = f' class="{calc_cls}"' if calc_cls else ""
-                    group_tds.append(f"<td{cls_attr}{c_style}>{_fmt_num(c_val, is_pct=cc['is_pct'], force_float=True)}</td>")
-                return group_tds
-
-            def _build_value_cells(col_df, tot_series, idx_tuple, is_total_row: bool = False) -> str:
-                tds = []
-                base_cls = "ea-piv-tot-cell" if is_total_row else ""
-                if has_col_group:
-                    for ck in col_keys:
-                        lookup = (*idx_tuple, ck) if idx_tuple else ck
-                        base_vals = []
-                        for k in num_keys:
-                            try:
-                                v = float(col_df.loc[lookup, k])
-                            except KeyError:
-                                v = 0.0
-                            base_vals.append(v)
-                        tds.extend(_render_metric_group_tds(base_vals, base_cls))
-                    if self.show_totals:
-                        tot_vals = []
-                        for k in num_keys:
-                            v = float(tot_series[k] if idx_tuple == () else tot_series.loc[idx_tuple if len(idx_tuple) > 1 else idx_tuple[0], k])
-                            tot_vals.append(v)
-                        tds.extend(_render_metric_group_tds(tot_vals, "ea-piv-tot-col"))
-                else:
-                    tot_vals = []
-                    for k in num_keys:
-                        v = float(tot_series[k] if idx_tuple == () else tot_series.loc[idx_tuple if len(idx_tuple) > 1 else idx_tuple[0], k])
-                        tot_vals.append(v)
-                    tds.extend(_render_metric_group_tds(tot_vals, base_cls))
-                return "".join(tds)
-
-            tbody_rows = []
-            for i1, r1_val in enumerate(top_r1_list):
-                node1_id = f"{tbl_uid}_l1_{i1}"
-                safe_r1 = _escape(str(r1_val))
-                r2_sub = g2_tot.loc[r1_val].sort_values(by=num_keys[0], ascending=False) if (g2_tot is not None and r1_val in g2_tot.index) else None
-                has_l2 = r2_sub is not None and len(r2_sub) > 0
-
-                if has_l2:
-                    row1_Attr = (
-                        f'class="ea-piv-row-l1 ea-piv-expandable" data-level="1" data-node="{node1_id}" '
-                        f'data-r1="{safe_r1}" onclick="window.toggleEaPivotRow(\'{tbl_uid}\', \'{node1_id}\', 1)"'
-                    )
-                    badge1 = f'<span class="ea-piv-cnt">{len(r2_sub)}</span>'
-                    label1_html = f'<span class="ea-piv-caret" id="caret_{node1_id}">▶</span> {safe_r1} {badge1}'
-                else:
-                    row1_Attr = f'class="ea-piv-row-l1" data-level="1" data-node="{node1_id}" data-r1="{safe_r1}"'
-                    label1_html = safe_r1
-
-                cells1 = _build_value_cells(g1_col, g1_tot, (r1_val,))
-                tbody_rows.append(f"<tr {row1_Attr}><th>{label1_html}</th>{cells1}</tr>")
-
-                if has_l2:
-                    for i2, r2_val in enumerate(r2_sub.index.tolist()):
-                        node2_id = f"{node1_id}_l2_{i2}"
-                        safe_r2 = _escape(str(r2_val))
-                        r3_sub = (
-                            g3_tot.loc[(r1_val, r2_val)].sort_values(by=num_keys[0], ascending=False)
-                            if (g3_tot is not None and (r1_val, r2_val) in g3_tot.index)
-                            else None
-                        )
-                        has_l3 = r3_sub is not None and len(r3_sub) > 0
-
-                        if has_l3:
-                            row2_Attr = (
-                                f'class="ea-piv-row-l2 ea-piv-expandable" data-level="2" data-parent="{node1_id}" '
-                                f'data-node="{node2_id}" data-r1="{safe_r1}" data-r2="{safe_r2}" '
-                                f'style="display:none;" onclick="window.toggleEaPivotRow(\'{tbl_uid}\', \'{node2_id}\', 2)"'
-                            )
-                            badge2 = f'<span class="ea-piv-cnt">{len(r3_sub)}</span>'
-                            label2_html = f'<span class="ea-piv-caret" id="caret_{node2_id}">▶</span> {safe_r2} {badge2}'
-                        else:
-                            row2_Attr = (
-                                f'class="ea-piv-row-l2" data-level="2" data-parent="{node1_id}" '
-                                f'data-node="{node2_id}" data-r1="{safe_r1}" data-r2="{safe_r2}" style="display:none;"'
-                            )
-                            label2_html = f'<span style="color:#64748b; margin-right:6px;">•</span>{safe_r2}'
-
-                        cells2 = _build_value_cells(g2_col, g2_tot, (r1_val, r2_val))
-                        tbody_rows.append(f"<tr {row2_Attr}><th class=\"ea-piv-th-l2\">{label2_html}</th>{cells2}</tr>")
-
-                        if has_l3:
-                            for r3_val in r3_sub.index.tolist():
-                                safe_r3 = _escape(str(r3_val))
-                                js_r3 = safe_r3.replace("\\", "\\\\").replace("'", "\\'")
-                                row3_Attr = (
-                                    f'class="ea-piv-row-l3 ea-piv-clickable-leaf" data-level="3" data-parent="{node2_id}" '
-                                    f'data-root="{node1_id}" data-r1="{safe_r1}" data-r2="{safe_r2}" data-r3="{safe_r3}" '
-                                    f'style="display:none;" title="Нажмите, чтобы отфильтровать путевые листы по {safe_r3}" '
-                                    f'onclick="window.selectEaPivotLeaf(\'{tbl_uid}\', \'{js_r3}\', this)"'
-                                )
-                                label3_html = f'<span style="color:#94a3b8; margin-right:6px;">🚗</span>{safe_r3}'
-                                cells3 = _build_value_cells(g3_col, g3_tot, (r1_val, r2_val, r3_val))
-                                tbody_rows.append(f"<tr {row3_Attr}><th class=\"ea-piv-th-l3\">{label3_html}</th>{cells3}</tr>")
-
-            if self.show_totals:
-                tot_cells = _build_value_cells(gt_col, gt_tot, (), is_total_row=True)
-                tbody_rows.append(f'<tr class="ea-piv-grand-total"><th>Итого</th>{tot_cells}</tr>')
-
-            tbl_classes = ["ea-pivot-table"]
-            if self.sticky_header:
-                tbl_classes.append("ea-piv-sticky-hdr")
-            if self.sticky_first_col:
-                tbl_classes.append("ea-piv-sticky-col")
-
-            html_table = (
-                f'<table class="{" ".join(tbl_classes)}" id="{tbl_uid}" data-target-table="{target_tbl_attr}">'
-                f'<thead>{"".join(thead_rows)}</thead>'
-                f'<tbody>{"".join(tbody_rows)}</tbody>'
-                f'</table>'
-            )
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            html_table = f"<p style='color:red;'>Ошибка расчета сводной матрицы: {e}</p>"
-
-        max_h_val = int(self.max_table_height or 0)
-        max_h_css = f"max-height: {max_h_val}px;" if max_h_val > 0 else ""
-
-        style_and_js = f"""
-        <style>
-        .ea-piv-scroll-wrap {{
-            width: 100%;
-            overflow-x: auto;
-            overflow-y: auto;
-            {max_h_css}
-            border: 1px solid #e2e8f0;
-            border-radius: 6px;
-            position: relative;
-        }}
-        .ea-pivot-table {{ width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; text-align: right; }}
-        .ea-pivot-table th, .ea-pivot-table td {{ border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; padding: 7px 12px; white-space: nowrap; }}
-        .ea-pivot-table thead th {{ background: #f8fafc; font-weight: 700; text-align: center; color: #334155; }}
-        .ea-pivot-table thead th.ea-piv-sub-th {{ font-size: 11.5px; color: #475569; background: #f1f5f9; padding: 5px 10px; }}
-        .ea-pivot-table tbody tr.ea-piv-row-l1:hover td, .ea-pivot-table tbody tr.ea-piv-row-l1:hover th {{ background: #f1f8e9; }}
-        .ea-pivot-table tbody tr.ea-piv-row-l1 th {{ text-align: left; background: #ffffff; color: #003F0B; font-weight: 600; }}
-        .ea-pivot-table tbody tr.ea-piv-expandable {{ cursor: pointer; user-select: none; }}
-        .ea-pivot-table tbody tr.ea-piv-expandable:hover th {{ color: #2bb24c; background: #f1f8e9; }}
-        .ea-pivot-table tbody tr.ea-piv-row-l2 {{ background: #fafdf7; font-size: 12.5px; }}
-        .ea-pivot-table tbody tr.ea-piv-row-l2:hover td, .ea-pivot-table tbody tr.ea-piv-row-l2:hover th {{ background: #eef8e3; }}
-        .ea-pivot-table tbody th.ea-piv-th-l2 {{ text-align: left; padding-left: 28px !important; color: #1e293b; font-weight: 600; background: #fafdf7; }}
-        .ea-pivot-table tbody tr.ea-piv-row-l3 {{ background: #ffffff; font-size: 12px; color: #475569; cursor: pointer; }}
-        .ea-pivot-table tbody tr.ea-piv-row-l3:hover td, .ea-pivot-table tbody tr.ea-piv-row-l3:hover th {{ background: #ecfccb !important; color: #003F0B; }}
-        .ea-pivot-table tbody tr.ea-piv-leaf-active td, .ea-pivot-table tbody tr.ea-piv-leaf-active th {{ background: #d9f99d !important; font-weight: 700 !important; color: #003F0B !important; }}
-        .ea-pivot-table tbody th.ea-piv-th-l3 {{ text-align: left; padding-left: 52px !important; color: #475569; font-weight: 500; background: #ffffff; }}
-        .ea-piv-caret {{ display: inline-block; width: 14px; font-size: 11px; color: #87C800; transition: transform 0.15s ease; }}
-        .ea-piv-cnt {{ display: inline-block; margin-left: 6px; padding: 1px 6px; font-size: 10px; font-weight: 600; color: #475569; background: #e2e8f0; border-radius: 10px; }}
-        .ea-piv-tot-col, .ea-piv-tot-hdr {{ font-weight: 700; background: #f8fafc !important; }}
-        .ea-piv-calc-td {{ background: #fcfdfd; }}
-        .ea-piv-grand-total th, .ea-piv-grand-total td {{ font-weight: 700; background: #f1f5f9 !important; color: #0f172a; border-top: 2px solid #cbd5e1; }}
-
-        .ea-piv-sticky-hdr thead tr:first-child th {{
-            position: sticky;
-            top: 0;
-            z-index: 4;
-            background: #f8fafc;
-            box-shadow: inset 0 -1px 0 #cbd5e1;
-        }}
-        .ea-piv-sticky-hdr thead tr:nth-child(2) th {{
-            position: sticky;
-            top: 32px;
-            z-index: 4;
-            background: #f1f5f9;
-            box-shadow: inset 0 -2px 0 #cbd5e1;
-        }}
-        .ea-piv-sticky-col tbody th {{
-            position: sticky;
-            left: 0;
-            z-index: 3;
-            box-shadow: inset -2px 0 0 #cbd5e1;
-        }}
-        .ea-piv-sticky-col thead tr:first-child th.ea-piv-corner-th {{
-            position: sticky;
-            left: 0;
-            z-index: 5;
-            box-shadow: inset -2px 0 0 #cbd5e1;
-        }}
-        .ea-piv-sticky-hdr.ea-piv-sticky-col thead tr:first-child th.ea-piv-corner-th {{
-            position: sticky;
-            top: 0;
-            left: 0;
-            z-index: 7;
-            box-shadow: inset -2px 0 0 #cbd5e1, inset 0 -1px 0 #cbd5e1;
-        }}
-        </style>
-        <script>
-        if (typeof window.toggleEaPivotRow === 'undefined') {{
-            window.toggleEaPivotRow = function(tblId, nodeId, level) {{
-                var tbl = document.getElementById(tblId);
-                if (!tbl) return;
-                var caret = document.getElementById('caret_' + nodeId);
-                var children = tbl.querySelectorAll('tr[data-parent="' + nodeId + '"]');
-                if (!children.length) return;
-                var isOpening = (children[0].style.display === 'none');
-                if (caret) caret.textContent = isOpening ? '▼' : '▶';
-
-                children.forEach(function(row) {{
-                    row.style.display = isOpening ? 'table-row' : 'none';
-                    if (!isOpening && level === 1) {{
-                        var childNode = row.getAttribute('data-node');
-                        if (childNode) {{
-                            var cCaret = document.getElementById('caret_' + childNode);
-                            if (cCaret) cCaret.textContent = '▶';
-                            var subChildren = tbl.querySelectorAll('tr[data-parent="' + childNode + '"]');
-                            subChildren.forEach(function(sr) {{ sr.style.display = 'none'; }});
-                        }}
-                    }}
-                }});
-            }};
-
-            window.expandAllEaPivot = function(tblId, expand) {{
-                var tbl = document.getElementById(tblId);
-                if (!tbl) return;
-                tbl.querySelectorAll('tr.ea-piv-row-l1').forEach(function(r) {{
-                    r.style.display = 'table-row';
-                }});
-                tbl.querySelectorAll('tr.ea-piv-row-l2, tr.ea-piv-row-l3').forEach(function(r) {{
-                    r.style.display = expand ? 'table-row' : 'none';
-                }});
-                tbl.querySelectorAll('.ea-piv-caret').forEach(function(c) {{
-                    c.textContent = expand ? '▼' : '▶';
-                }});
-            }};
-
-            window.selectEaPivotLeaf = function(tblId, leafVal, rowEl) {{
-                var tbl = document.getElementById(tblId);
-                if (!tbl) return;
-                var wasActive = rowEl.classList.contains('ea-piv-leaf-active');
-                tbl.querySelectorAll('tr.ea-piv-leaf-active').forEach(function(r) {{
-                    r.classList.remove('ea-piv-leaf-active');
-                }});
-                var targetTbl = tbl.getAttribute('data-target-table') || '__ALL__';
-                if (wasActive) {{
-                    if (typeof window.filterEaDataTable === 'function' && targetTbl !== '__NONE__') {{
-                        window.filterEaDataTable(targetTbl, '', true);
-                    }}
-                }} else {{
-                    rowEl.classList.add('ea-piv-leaf-active');
-                    if (typeof window.filterEaDataTable === 'function' && targetTbl !== '__NONE__') {{
-                        window.filterEaDataTable(targetTbl, leafVal, true);
-                    }}
-                }}
-            }};
-
-            window.filterEaPivot = function(tblId, rawQuery) {{
-                var tbl = document.getElementById(tblId);
-                if (!tbl) return;
-                var q = String(rawQuery || '').trim().toLowerCase();
-                var clearBtn = document.getElementById(tblId + '_search_clear');
-                if (clearBtn) clearBtn.style.display = q ? 'inline-block' : 'none';
-
-                var l1Rows = tbl.querySelectorAll('tr.ea-piv-row-l1');
-                var l2Rows = tbl.querySelectorAll('tr.ea-piv-row-l2');
-                var l3Rows = tbl.querySelectorAll('tr.ea-piv-row-l3');
-
-                tbl.querySelectorAll('tr.ea-piv-leaf-active').forEach(function(r) {{
-                    r.classList.remove('ea-piv-leaf-active');
-                }});
-
-                var targetTbl = tbl.getAttribute('data-target-table') || '__ALL__';
-
-                if (!q) {{
-                    l1Rows.forEach(function(r) {{ r.style.display = 'table-row'; }});
-                    l2Rows.forEach(function(r) {{ r.style.display = 'none'; }});
-                    l3Rows.forEach(function(r) {{ r.style.display = 'none'; }});
-                    tbl.querySelectorAll('.ea-piv-caret').forEach(function(c) {{ c.textContent = '▶'; }});
-                    if (typeof window.filterEaDataTable === 'function' && targetTbl !== '__NONE__') {{
-                        window.filterEaDataTable(targetTbl, '', true);
-                    }}
-                    return;
-                }}
-
-                l1Rows.forEach(function(r) {{ r.style.display = 'none'; }});
-                l2Rows.forEach(function(r) {{ r.style.display = 'none'; }});
-                l3Rows.forEach(function(r) {{ r.style.display = 'none'; }});
-                tbl.querySelectorAll('.ea-piv-caret').forEach(function(c) {{ c.textContent = '▶'; }});
-
-                var showL1 = {{}};
-                var showL2 = {{}};
-                var l2HasMatchedL3 = {{}};
-                var l1HasMatchedChild = {{}};
-
-                l3Rows.forEach(function(r3) {{
-                    var v3 = String(r3.getAttribute('data-r3') || '').toLowerCase();
-                    if (v3.indexOf(q) !== -1) {{
-                        r3.style.display = 'table-row';
-                        r3.classList.add('ea-piv-leaf-active');
-                        var p2 = r3.getAttribute('data-parent');
-                        var p1 = r3.getAttribute('data-root');
-                        if (p2) {{
-                            showL2[p2] = true;
-                            l2HasMatchedL3[p2] = true;
-                        }}
-                        if (p1) {{
-                            showL1[p1] = true;
-                            l1HasMatchedChild[p1] = true;
-                        }}
-                    }}
-                }});
-
-                l2Rows.forEach(function(r2) {{
-                    var v2 = String(r2.getAttribute('data-r2') || '').toLowerCase();
-                    var n2 = r2.getAttribute('data-node');
-                    var p1 = r2.getAttribute('data-parent');
-                    if (v2.indexOf(q) !== -1) {{
-                        showL2[n2] = true;
-                        if (p1) {{
-                            showL1[p1] = true;
-                            l1HasMatchedChild[p1] = true;
-                        }}
-                        if (!l2HasMatchedL3[n2]) {{
-                            tbl.querySelectorAll('tr.ea-piv-row-l3[data-parent="' + n2 + '"]').forEach(function(ch3) {{
-                                ch3.style.display = 'table-row';
-                            }});
-                        }}
-                    }}
-                }});
-
-                l1Rows.forEach(function(r1) {{
-                    var v1 = String(r1.getAttribute('data-r1') || '').toLowerCase();
-                    var n1 = r1.getAttribute('data-node');
-                    if (v1.indexOf(q) !== -1) {{
-                        showL1[n1] = true;
-                        if (!l1HasMatchedChild[n1]) {{
-                            tbl.querySelectorAll('tr.ea-piv-row-l2[data-parent="' + n1 + '"]').forEach(function(ch2) {{
-                                var cn2 = ch2.getAttribute('data-node');
-                                showL2[cn2] = true;
-                            }});
-                        }}
-                    }}
-                }});
-
-                Object.keys(showL2).forEach(function(n2) {{
-                    var r2 = tbl.querySelector('tr.ea-piv-row-l2[data-node="' + n2 + '"]');
-                    if (r2) {{
-                        r2.style.display = 'table-row';
-                        var c2 = document.getElementById('caret_' + n2);
-                        if (c2) c2.textContent = '▼';
-                    }}
-                }});
-
-                Object.keys(showL1).forEach(function(n1) {{
-                    var r1 = tbl.querySelector('tr.ea-piv-row-l1[data-node="' + n1 + '"]');
-                    if (r1) {{
-                        r1.style.display = 'table-row';
-                        var c1 = document.getElementById('caret_' + n1);
-                        if (c1) c1.textContent = '▼';
-                    }}
-                }});
-
-                if (typeof window.filterEaDataTable === 'function' && targetTbl !== '__NONE__') {{
-                    window.filterEaDataTable(targetTbl, String(rawQuery || '').trim(), true);
-                }}
-            }};
-
-            window.clearEaPivotSearch = function(tblId) {{
-                var inp = document.getElementById(tblId + '_search_inp');
-                if (inp) inp.value = '';
-                window.filterEaPivot(tblId, '');
-            }};
-        }}
-        </script>
-        """
-
-        col_sub = f" × {self.col_group_col}" if has_col_group else ""
-        all_titles_list = val_cols + [cc["name"] for cc in active_calc_cols]
-        vals_title = ", ".join(all_titles_list)
-
-        search_box_html = ""
-        if self.show_search:
-            search_box_html = f'''
-            <div style="display:flex; align-items:center; gap:4px;">
-                <input type="text" id="{tbl_uid}_search_inp"
-                       placeholder="🔍 Госномер (А999АА999), модель или тип..."
+                       placeholder="🔍 Поиск по группе, подкатегории или ID..."
                        oninput="window.filterEaPivot('{tbl_uid}', this.value)"
                        style="padding:4px 10px; font-size:12px; min-width:240px; border:1px solid #87C800;
                               border-radius:6px; outline:none; background:#ffffff; color:#1e293b;" />
@@ -3373,8 +2780,11 @@ def _extract_month_info(s: pd.Series) -> tuple[pd.Series, pd.Series]:
     """
     s = _ensure_series(s)
     cache_key = (id(s), len(s), str(getattr(s, "name", "")))
-    if cache_key in DataMemoryCache._month_series_cache:
-        return DataMemoryCache._month_series_cache[cache_key]
+    with DataMemoryCache._lock:
+        cached_m = DataMemoryCache._month_series_cache.get(cache_key)
+        if cached_m is not None:
+            DataMemoryCache._month_series_cache.move_to_end(cache_key)
+            return cached_m
 
     names = pd.Series(index=s.index, dtype="object")
     nums = pd.Series(index=s.index, dtype="float64")
@@ -3386,7 +2796,7 @@ def _extract_month_info(s: pd.Series) -> tuple[pd.Series, pd.Series]:
         nums[valid] = m_num[valid]
         names[valid] = m_num[valid].astype(int).map(lambda m: _RU_MONTHS_ORDER[m - 1])
         res = (names.fillna(""), nums.fillna(99))
-        DataMemoryCache._month_series_cache[cache_key] = res
+        DataMemoryCache._put_lru(DataMemoryCache._month_series_cache, cache_key, res, DataMemoryCache._MAX_SERIES, owner_obj=s)
         return res
 
     str_s = s.fillna("").astype(str).str.strip()
@@ -3413,8 +2823,603 @@ def _extract_month_info(s: pd.Series) -> tuple[pd.Series, pd.Series]:
                 nums[matched_idx] = m_idx
 
     res = (names.fillna(""), nums.fillna(99))
-    DataMemoryCache._month_series_cache[cache_key] = res
+    DataMemoryCache._put_lru(DataMemoryCache._month_series_cache, cache_key, res, DataMemoryCache._MAX_SERIES, owner_obj=s)
     return res
+
+
+_CHART_ANIM_ASSETS_HTML = r"""
+<style id="ea-chart-anim-css">
+@keyframes eaZoomIn {
+    0%   { opacity: 0; transform: scale(0.92); }
+    100% { opacity: 1; transform: scale(1); }
+}
+@keyframes eaZoomOut {
+    0%   { opacity: 0; transform: scale(1.05); }
+    100% { opacity: 1; transform: scale(1); }
+}
+@keyframes eaFadeUp {
+    0%   { opacity: 0; transform: translateY(10px); }
+    100% { opacity: 1; transform: translateY(0); }
+}
+@keyframes eaSlideUp {
+    0%   { opacity: 0; transform: translateY(24px); }
+    100% { opacity: 1; transform: translateY(0); }
+}
+@keyframes eaSlideLeft {
+    0%   { opacity: 0; transform: translateX(-26px); }
+    100% { opacity: 1; transform: translateX(0); }
+}
+@keyframes eaFadeOnly {
+    0%   { opacity: 0; }
+    100% { opacity: 1; }
+}
+@keyframes eaPieSpin {
+    0%   { opacity: 0; transform: rotate(-95deg) scale(0.86); }
+    100% { opacity: 1; transform: rotate(0deg) scale(1); }
+}
+@keyframes eaPieSpinBack {
+    0%   { opacity: 0; transform: rotate(75deg) scale(1.04); }
+    100% { opacity: 1; transform: rotate(0deg) scale(1); }
+}
+
+.ea-anim-zoom-in    { animation: eaZoomIn var(--ea-anim-dur, 480ms) cubic-bezier(0.22, 1, 0.36, 1) both; }
+.ea-anim-zoom-out   { animation: eaZoomOut var(--ea-anim-dur, 480ms) cubic-bezier(0.22, 1, 0.36, 1) both; }
+.ea-anim-fade-up    { animation: eaFadeUp var(--ea-anim-dur, 480ms) cubic-bezier(0.22, 1, 0.36, 1) both; }
+.ea-anim-slide-up   { animation: eaSlideUp var(--ea-anim-dur, 480ms) cubic-bezier(0.22, 1, 0.36, 1) both; }
+.ea-anim-slide-left { animation: eaSlideLeft var(--ea-anim-dur, 480ms) cubic-bezier(0.22, 1, 0.36, 1) both; }
+.ea-anim-fade-only  { animation: eaFadeOnly var(--ea-anim-dur, 480ms) ease-out both; }
+.ea-anim-refresh    { animation: eaFadeUp 260ms ease-out both; }
+.ea-anim-pie-spin {
+    transform-box: fill-box;
+    transform-origin: center center;
+    animation: eaPieSpin var(--ea-anim-dur, 480ms) cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.ea-anim-pie-spin-back {
+    transform-box: fill-box;
+    transform-origin: center center;
+    animation: eaPieSpinBack var(--ea-anim-dur, 480ms) cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.ea-chart-card {
+    position: relative;
+    transition: box-shadow 0.25s ease, border-color 0.25s ease,
+                opacity 0.42s cubic-bezier(0.22, 1, 0.36, 1),
+                transform 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ea-chart-card:hover {
+    box-shadow: 0 10px 26px rgba(15, 23, 42, 0.07);
+}
+.ea-chart-card.ea-reveal-hidden {
+    opacity: 0;
+    transform: translateY(16px);
+}
+.ea-chart-card.ea-reveal-visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+.kpi-card {
+    transition: transform 0.22s ease, box-shadow 0.22s ease;
+}
+.kpi-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+}
+
+.ea-chart-topbar {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    z-index: 12;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.ea-chart-collapsed-title {
+    display: none;
+    font-size: 13.5px;
+    font-weight: 700;
+    color: #003F0B;
+    user-select: none;
+}
+.ea-chart-collapsed-hint {
+    font-size: 11.5px;
+    font-weight: 500;
+    color: #64748b;
+    margin-left: 6px;
+}
+.ea-chart-card.ea-collapsed {
+    padding-top: 11px !important;
+    padding-bottom: 11px !important;
+}
+.ea-chart-card.ea-collapsed .ea-chart-topbar {
+    position: static;
+    width: 100%;
+    justify-content: space-between;
+    cursor: pointer;
+}
+.ea-chart-card.ea-collapsed .ea-chart-collapsed-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.ea-chart-toggle-btn {
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    border: 1px solid #e2e8f0;
+    background: rgba(255, 255, 255, 0.92);
+    color: #475569;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+.ea-chart-toggle-btn:hover {
+    border-color: #87C800;
+    color: #003F0B;
+    background: #f1f8e9;
+}
+.ea-toggle-icon {
+    display: inline-block;
+    transition: transform 0.34s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ea-chart-card.ea-collapsed .ea-toggle-icon {
+    transform: rotate(-90deg);
+}
+
+.ea-chart-collapsible {
+    display: grid;
+    grid-template-rows: 1fr;
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    transform-origin: top center;
+    transition: grid-template-rows 0.38s cubic-bezier(0.22, 1, 0.36, 1),
+                opacity 0.24s ease,
+                transform 0.38s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ea-chart-collapsible-inner {
+    overflow: hidden;
+    min-height: 0;
+}
+.ea-chart-card.ea-collapsed .ea-chart-collapsible {
+    grid-template-rows: 0fr;
+    opacity: 0;
+    transform: translateY(-6px) scale(0.985);
+    pointer-events: none;
+}
+
+/* Подсветка секторов круга БЕЗ transition на hovertext (подсказка больше не вылетает из угла) */
+.js-plotly-plot .pielayer .slice path {
+    transition: filter 0.2s ease;
+}
+.js-plotly-plot .pielayer .slice:hover path {
+    filter: brightness(1.06);
+}
+.ea-pie-month-btn:hover, .ea-dut-btn:hover {
+    filter: brightness(0.97);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .ea-chart-card, .ea-chart-collapsible, .ea-toggle-icon,
+    .ea-anim-zoom-in, .ea-anim-zoom-out, .ea-anim-fade-up,
+    .ea-anim-slide-up, .ea-anim-slide-left, .ea-anim-fade-only,
+    .ea-anim-pie-spin, .ea-anim-pie-spin-back, .ea-anim-refresh {
+        animation: none !important;
+        transition: none !important;
+    }
+}
+</style>
+<script>
+if (typeof window._eaAnimReady === 'undefined') {
+    window._eaAnimReady = true;
+
+    window._eaReducedMotion = function() {
+        return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    };
+
+    window._eaGetChartAnimCfg = function(el) {
+        var card = (el && el.classList && el.classList.contains('ea-chart-card'))
+            ? el
+            : (el && typeof el.closest === 'function' ? el.closest('.ea-chart-card') : null);
+        var style = (card && card.getAttribute('data-anim-style')) || 'auto';
+        var speed = Number((card && card.getAttribute('data-anim-speed')) || 480);
+        if (!speed || isNaN(speed)) speed = 480;
+        return { style: style, speed: speed };
+    };
+
+    window._eaAnimClasses = [
+        'ea-anim-zoom-in', 'ea-anim-zoom-out', 'ea-anim-fade-up',
+        'ea-anim-slide-up', 'ea-anim-slide-left', 'ea-anim-fade-only'
+    ];
+
+    /* 1. Анимация переходов при смене данных / среза / Drill-Down */
+    window._eaPlayElAnim = function(el, animKind) {
+        if (!el || window._eaReducedMotion()) return;
+        var ac = window._eaGetChartAnimCfg(el);
+        if (ac.style === 'none') return;
+        el.style.setProperty('--ea-anim-dur', ac.speed + 'ms');
+
+        var pieTraces = el.querySelectorAll('.pielayer .trace');
+        var useSpin = (ac.style === 'spin') || (ac.style === 'auto' && pieTraces && pieTraces.length > 0);
+        if (useSpin && pieTraces && pieTraces.length) {
+            var pieCls = (animKind === 'drill-out') ? 'ea-anim-pie-spin-back' : 'ea-anim-pie-spin';
+            pieTraces.forEach(function(pt) {
+                pt.style.setProperty('--ea-anim-dur', ac.speed + 'ms');
+                pt.classList.remove('ea-anim-pie-spin', 'ea-anim-pie-spin-back');
+                void pt.getBoundingClientRect();
+                pt.classList.add(pieCls);
+            });
+            return;
+        }
+
+        if (ac.style === 'cascade') {
+            window._eaPlayCascade(el, ac.speed);
+            return;
+        }
+
+        var cls = 'ea-anim-fade-up';
+        if (ac.style === 'zoom') {
+            cls = (animKind === 'drill-out') ? 'ea-anim-zoom-out' : 'ea-anim-zoom-in';
+        } else if (ac.style === 'slide_up') {
+            cls = 'ea-anim-slide-up';
+        } else if (ac.style === 'slide_left') {
+            cls = 'ea-anim-slide-left';
+        } else if (ac.style === 'fade') {
+            cls = 'ea-anim-fade-only';
+        } else {
+            cls = (animKind === 'drill-in')
+                ? 'ea-anim-zoom-in'
+                : ((animKind === 'drill-out') ? 'ea-anim-zoom-out' : 'ea-anim-fade-up');
+        }
+
+        window._eaAnimClasses.forEach(function(c) { el.classList.remove(c); });
+        void el.offsetWidth;
+        el.classList.add(cls);
+    };
+
+    /* Каскадная анимация элементов (столбцы / сектора / линии по очереди) */
+    window._eaPlayCascade = function(plotDiv, dur) {
+        var step = Math.max(18, Math.min(55, Math.round(dur / 14)));
+        var items = plotDiv.querySelectorAll('.barlayer .point, .pielayer .slice, .scatterlayer .trace');
+        if (!items.length) {
+            window._eaPlayElAnim(plotDiv, 'fade');
+            return;
+        }
+        items.forEach(function(item, idx) {
+            var delay = Math.min(idx, 18) * step;
+            item.style.transition = 'none';
+            item.style.opacity = '0';
+            item.style.transformBox = 'fill-box';
+            item.style.transformOrigin = 'center bottom';
+            item.style.transform = 'translateY(10px) scale(0.96)';
+            void item.getBoundingClientRect();
+            item.style.transition = 'transform ' + dur + 'ms cubic-bezier(0.22, 1, 0.36, 1) ' + delay + 'ms, opacity ' + Math.round(dur * 0.7) + 'ms ease-out ' + delay + 'ms';
+            item.style.opacity = '1';
+            item.style.transform = 'translateY(0) scale(1)';
+            setTimeout(function() {
+                item.style.transition = '';
+                item.style.transform = '';
+                item.style.opacity = '';
+            }, dur + delay + 80);
+        });
+    };
+
+    /* 2. Первичная анимация при появлении карточки в кадре (ждёт загрузку Plotly из CDN) */
+    window._eaAnimateChartEntrance = function(cardEl, retry) {
+        if (!cardEl || window._eaReducedMotion()) return;
+        var ac = window._eaGetChartAnimCfg(cardEl);
+        if (ac.style === 'none') return;
+
+        var plots = cardEl.querySelectorAll('.js-plotly-plot');
+        if (!plots.length) {
+            if ((retry || 0) < 50) {
+                setTimeout(function() { window._eaAnimateChartEntrance(cardEl, (retry || 0) + 1); }, 140);
+            }
+            return;
+        }
+        var hasSvg = (typeof Plotly !== 'undefined');
+        if (hasSvg) {
+            hasSvg = false;
+            plots.forEach(function(p) {
+                if (p.querySelector('svg.main-svg .plot, svg.main-svg .pielayer')) hasSvg = true;
+            });
+        }
+        if (!hasSvg) {
+            if ((retry || 0) < 50) {
+                setTimeout(function() { window._eaAnimateChartEntrance(cardEl, (retry || 0) + 1); }, 140);
+            }
+            return;
+        }
+
+        var dur = ac.speed;
+        plots.forEach(function(plotDiv) {
+            if (plotDiv._eaEntrancePlayed) return;
+            plotDiv._eaEntrancePlayed = true;
+            plotDiv.style.setProperty('--ea-anim-dur', dur + 'ms');
+
+            /* Если выбран конкретный стиль (не auto) — применяем его напрямую */
+            if (ac.style !== 'auto') {
+                window._eaPlayElAnim(plotDiv, 'drill-in');
+                return;
+            }
+
+            /* Режим "auto": каждому типу графика — своя лучшая анимация */
+            plotDiv.querySelectorAll('.scatterlayer path.js-line').forEach(function(path, idx) {
+                try {
+                    var cs = window.getComputedStyle(path);
+                    var origDash = path.style.strokeDasharray || '';
+                    var isDashed = cs.strokeDasharray && cs.strokeDasharray !== 'none' && cs.strokeDasharray !== '0px';
+                    var len = (typeof path.getTotalLength === 'function') ? path.getTotalLength() : 0;
+                    var lineDur = Math.round(dur * 1.25);
+                    if (!isDashed && len > 2 && isFinite(len)) {
+                        path.style.transition = 'none';
+                        path.style.strokeDasharray = len + ' ' + len;
+                        path.style.strokeDashoffset = String(len);
+                        void path.getBoundingClientRect();
+                        path.style.transition = 'stroke-dashoffset ' + lineDur + 'ms cubic-bezier(0.22, 1, 0.36, 1) ' + (idx * 65) + 'ms';
+                        path.style.strokeDashoffset = '0';
+                        setTimeout(function() {
+                            path.style.transition = '';
+                            path.style.strokeDasharray = origDash;
+                            path.style.strokeDashoffset = '';
+                        }, lineDur + 120 + idx * 65);
+                    } else {
+                        path.style.opacity = '0';
+                        void path.getBoundingClientRect();
+                        path.style.transition = 'opacity ' + dur + 'ms ease-out ' + (idx * 60) + 'ms';
+                        path.style.opacity = '1';
+                        setTimeout(function() { path.style.transition = ''; path.style.opacity = ''; }, dur + 100 + idx * 60);
+                    }
+                } catch (e) {}
+            });
+
+            plotDiv.querySelectorAll('.scatterlayer .points').forEach(function(g) {
+                g.style.opacity = '0';
+                void g.getBoundingClientRect();
+                g.style.transition = 'opacity ' + Math.round(dur * 0.7) + 'ms ease-out ' + Math.round(dur * 0.35) + 'ms';
+                g.style.opacity = '1';
+                setTimeout(function() { g.style.transition = ''; g.style.opacity = ''; }, dur + 120);
+            });
+
+            var hasNegBars = Array.isArray(plotDiv.data) && plotDiv.data.some(function(tr) {
+                return tr && tr.type === 'bar' && Array.isArray(tr.y) && tr.y.some(function(v) { return Number(v) < 0; });
+            });
+            plotDiv.querySelectorAll('.barlayer .bars').forEach(function(bGroup, idx) {
+                bGroup.style.transformBox = 'fill-box';
+                bGroup.style.transformOrigin = hasNegBars ? 'center center' : 'center bottom';
+                bGroup.style.opacity = '0';
+                bGroup.style.transform = hasNegBars ? 'translateY(10px)' : 'scaleY(0.18)';
+                void bGroup.getBoundingClientRect();
+                bGroup.style.transition = 'transform ' + dur + 'ms cubic-bezier(0.22, 1, 0.36, 1) ' + (idx * 55) + 'ms, opacity ' + Math.round(dur * 0.65) + 'ms ease-out';
+                bGroup.style.opacity = '1';
+                bGroup.style.transform = hasNegBars ? 'translateY(0)' : 'scaleY(1)';
+                setTimeout(function() {
+                    bGroup.style.transition = '';
+                    bGroup.style.transform = '';
+                    bGroup.style.opacity = '';
+                }, dur + 120 + idx * 55);
+            });
+
+            plotDiv.querySelectorAll('.pielayer .trace').forEach(function(pTrace, idx) {
+                var pieDur = Math.round(dur * 1.25);
+                pTrace.style.transformBox = 'fill-box';
+                pTrace.style.transformOrigin = 'center center';
+                pTrace.style.opacity = '0';
+                pTrace.style.transform = 'rotate(-95deg) scale(0.86)';
+                void pTrace.getBoundingClientRect();
+                pTrace.style.transition = 'transform ' + pieDur + 'ms cubic-bezier(0.22, 1, 0.36, 1) ' + (idx * 70) + 'ms, opacity ' + Math.round(dur * 0.75) + 'ms ease-out ' + (idx * 70) + 'ms';
+                pTrace.style.opacity = '1';
+                pTrace.style.transform = 'rotate(0deg) scale(1)';
+                setTimeout(function() {
+                    pTrace.style.transition = '';
+                    pTrace.style.transform = '';
+                    pTrace.style.opacity = '';
+                }, pieDur + 120 + idx * 70);
+            });
+        });
+    };
+
+    /* 3. Проверка возможности живого морфинга */
+    window._eaCanMorphTraces = function(oldTraces, newTraces) {
+        if (!Array.isArray(oldTraces) || !Array.isArray(newTraces)) return false;
+        if (oldTraces.length === 0 || oldTraces.length !== newTraces.length) return false;
+        for (var i = 0; i < newTraces.length; i++) {
+            var nt = newTraces[i], ot = oldTraces[i];
+            if (!nt || !ot) return false;
+            var nType = nt.type || 'scatter', oType = ot.type || 'scatter';
+            if (nType === 'pie' || nType === 'treemap' || nType === 'sunburst' || nType !== oType) return false;
+            if (!Array.isArray(nt.x) || !Array.isArray(ot.x) || nt.x.length !== ot.x.length || nt.x.length === 0) return false;
+            for (var j = 0; j < nt.x.length; j++) {
+                if (String(nt.x[j]) !== String(ot.x[j])) return false;
+            }
+        }
+        return true;
+    };
+
+    /* 4. Единая анимированная перерисовка Plotly с учётом выбранного стиля и скорости */
+    window._eaAnimatedPlotlyReact = function(plotDiv, traces, animKind) {
+        if (!plotDiv || !traces || typeof Plotly === 'undefined') return;
+        var ac = window._eaGetChartAnimCfg(plotDiv);
+        var cleanTraces = JSON.parse(JSON.stringify(traces));
+        var isPieOrTree = cleanTraces.some(function(t) {
+            return t.type === 'pie' || t.type === 'treemap' || t.type === 'sunburst';
+        });
+        var reduced = window._eaReducedMotion() || (ac.style === 'none');
+        var canMorph = (!reduced && ac.style === 'auto' && !isPieOrTree && (!animKind || animKind === 'auto') && window._eaCanMorphTraces(plotDiv.data, cleanTraces));
+
+        if (!plotDiv.layout) plotDiv.layout = {};
+        plotDiv.layout.datarevision = (plotDiv.layout.datarevision || 0) + 1;
+
+        if (!isPieOrTree) {
+            if (plotDiv.layout.xaxis)  { delete plotDiv.layout.xaxis.range;  plotDiv.layout.xaxis.autorange = true; }
+            if (plotDiv.layout.yaxis)  { delete plotDiv.layout.yaxis.range;  plotDiv.layout.yaxis.autorange = true; }
+            if (plotDiv.layout.yaxis2) { delete plotDiv.layout.yaxis2.range; plotDiv.layout.yaxis2.autorange = true; }
+            if (plotDiv.layout.legend && plotDiv.layout.legend.orientation === 'h' && Number(plotDiv.layout.legend.y) < 0) {
+                var maxXL = 0;
+                cleanTraces.forEach(function(t) {
+                    if (Array.isArray(t.x)) {
+                        t.x.forEach(function(xv) {
+                            var s = String(xv || '');
+                            if (s.length > maxXL) maxXL = s.length;
+                        });
+                    }
+                });
+                var hEst = Math.max(180, (plotDiv.offsetHeight || 380) - 130);
+                var dropPx = 42 + maxXL * 2.35;
+                plotDiv.layout.legend.y = -Math.min(0.68, Math.max(0.30, dropPx / hEst));
+                if (plotDiv.layout.margin) plotDiv.layout.margin.b = 65 + Math.max(0, (maxXL - 12) * 3) + 48;
+            }
+        }
+
+        if (canMorph) {
+            plotDiv.layout.transition = { duration: ac.speed, easing: 'cubic-in-out' };
+            Plotly.react(plotDiv, cleanTraces, plotDiv.layout);
+        } else {
+            delete plotDiv.layout.transition;
+            Plotly.react(plotDiv, cleanTraces, plotDiv.layout);
+            if (!reduced) {
+                window._eaPlayElAnim(plotDiv, animKind || 'fade');
+            }
+        }
+    };
+
+    /* 5. Плавный пересчёт итоговых чисел (Count-Up) в шапках графиков */
+    window._eaParseFmtNum = function(txt) {
+        var s = String(txt || '').trim();
+        var m = s.match(/^([+-]?)([\d\s,\u00a0]+(?:\.\d+)?)(\s*[%а-яА-Яa-zA-Z.]*)$/);
+        if (!m) return null;
+        var numPart = m[2];
+        var sep = numPart.indexOf(',') !== -1 ? ',' : (numPart.indexOf(' ') !== -1 ? ' ' : '');
+        var decIdx = numPart.indexOf('.');
+        var decimals = decIdx >= 0 ? (numPart.length - decIdx - 1) : 0;
+        var val = parseFloat((m[1] === '-' ? '-' : '') + numPart.replace(/[\s,\u00a0]/g, ''));
+        if (isNaN(val)) return null;
+        return { val: val, plus: m[1] === '+', sep: sep, decimals: decimals, suffix: m[3] || '' };
+    };
+
+    window._eaFormatLike = function(val, meta) {
+        var sign = val < -1e-9 ? '-' : (meta.plus && val > 1e-9 ? '+' : '');
+        var absStr = Math.abs(val).toFixed(meta.decimals);
+        var parts = absStr.split('.');
+        if (meta.sep) {
+            parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, meta.sep);
+        }
+        return sign + parts.join('.') + meta.suffix;
+    };
+
+    window._eaUpdateHeaderAnimated = function(hdrEl, newHtml) {
+        if (!hdrEl) return;
+        var ac = window._eaGetChartAnimCfg(hdrEl);
+        var prevVals = hdrEl._eaPrevNums || [];
+        hdrEl.innerHTML = newHtml;
+        var bolds = hdrEl.querySelectorAll('b');
+        var nextVals = [];
+        var reduced = window._eaReducedMotion() || (ac.style === 'none');
+        var tasks = [];
+
+        bolds.forEach(function(b, idx) {
+            var parsed = window._eaParseFmtNum(b.textContent);
+            if (!parsed) {
+                nextVals.push(null);
+                return;
+            }
+            nextVals.push(parsed.val);
+            if (!reduced && prevVals[idx] !== undefined && prevVals[idx] !== null && Math.abs(prevVals[idx] - parsed.val) > 1e-6) {
+                tasks.push({ el: b, from: prevVals[idx], to: parsed.val, meta: parsed });
+            }
+        });
+        hdrEl._eaPrevNums = nextVals;
+
+        if (!tasks.length) return;
+        var startTs = performance.now();
+        var dur = Math.min(800, Math.max(180, Math.round(ac.speed * 0.72)));
+        function tick(now) {
+            var t = Math.min(1, (now - startTs) / dur);
+            var eased = 1 - Math.pow(1 - t, 3);
+            for (var i = 0; i < tasks.length; i++) {
+                var tk = tasks[i];
+                var cur = tk.from + (tk.to - tk.from) * eased;
+                tk.el.textContent = window._eaFormatLike(t >= 1 ? tk.to : cur, tk.meta);
+            }
+            if (t < 1) requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+    };
+
+    /* 6. Плавное сворачивание и раскрытие карточки графика */
+    window.toggleEaChartCard = function(uid, ev) {
+        if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+        var card = document.getElementById(uid + '-card');
+        if (!card) return;
+        var willCollapse = !card.classList.contains('ea-collapsed');
+        card.classList.toggle('ea-collapsed', willCollapse);
+        var btn = card.querySelector('.ea-chart-toggle-btn');
+        if (btn) btn.title = willCollapse ? 'Развернуть график' : 'Свернуть график';
+
+        setTimeout(function() {
+            if (!willCollapse && typeof Plotly !== 'undefined') {
+                card.querySelectorAll('.js-plotly-plot').forEach(function(p) {
+                    try { Plotly.Plots.resize(p); } catch (e) {}
+                });
+            }
+            window.dispatchEvent(new Event('resize'));
+        }, 390);
+    };
+
+    /* 7. Scroll Reveal при прокрутке страницы */
+    window._eaInitCardReveal = function() {
+        var cards = document.querySelectorAll('.ea-chart-card:not([data-ea-reveal-bound])');
+        if (!cards.length) return;
+        if (window._eaReducedMotion() || typeof IntersectionObserver === 'undefined') {
+            cards.forEach(function(c) { c.setAttribute('data-ea-reveal-bound', '1'); });
+            return;
+        }
+        var obs = new IntersectionObserver(function(entries) {
+            entries.forEach(function(entry) {
+                if (entry.isIntersecting) {
+                    entry.target.classList.remove('ea-reveal-hidden');
+                    entry.target.classList.add('ea-reveal-visible');
+                    window._eaAnimateChartEntrance(entry.target, 0);
+                    obs.unobserve(entry.target);
+                }
+            });
+        }, { threshold: 0.08 });
+
+        cards.forEach(function(c) {
+            c.setAttribute('data-ea-reveal-bound', '1');
+            var ac = window._eaGetChartAnimCfg(c);
+            if (ac.style === 'none') {
+                c.classList.add('ea-reveal-visible');
+                return;
+            }
+            var r = c.getBoundingClientRect();
+            if (r.top > window.innerHeight * 0.96) {
+                c.classList.add('ea-reveal-hidden');
+                obs.observe(c);
+            } else {
+                c.classList.add('ea-reveal-visible');
+                setTimeout(function() { window._eaAnimateChartEntrance(c, 0); }, 80);
+            }
+        });
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', window._eaInitCardReveal);
+    } else {
+        setTimeout(window._eaInitCardReveal, 60);
+    }
+    window.addEventListener('load', function() {
+        window._eaInitCardReveal();
+        document.querySelectorAll('.ea-chart-card.ea-reveal-visible').forEach(function(c) {
+            window._eaAnimateChartEntrance(c, 0);
+        });
+    });
+}
+</script>
+"""
 
 
 @dataclass
@@ -3453,6 +3458,11 @@ class PlotlyChartBlock(Block):
     fact_col: str = ""
     norm_col: str = ""
     plate_col: str = ""
+    dut_col: str = ""
+    pct_col: str = ""
+    dut_pct_op: str = "gt"
+    dut_pct_val: float = 3.0
+    dut_count_mode: str = "unique_ts"
     pie_display_mode: str = "single_interactive"
     filter_col: str = ""
     filter_op: str = ">"
@@ -3474,9 +3484,11 @@ class PlotlyChartBlock(Block):
     value_label_mode: str = "auto"
     hover_format: str = "default"
     hover_custom_tpl: str = ""
-    all_groups_label: str = "Итого (Все типы ТС)"
+    all_groups_label: str = "Итого (Все категории)"
     prefix_legend_with_group: bool = False
     show_summary_header: bool = True
+    show_summary_total: bool = False
+    summary_total_label: str = "Σ Итого"
     custom_legend_names: str = ""
     column_aliases: dict = field(default_factory=dict)
     custom_x_title: str = ""
@@ -3497,6 +3509,34 @@ class PlotlyChartBlock(Block):
     combo_level2_sort: str = "value_desc"
     combo_level3_sort: str = "value_desc"
     combo_sort_series_idx: int = 0
+    bar_text_pos: str = "outside"
+    bar_text_angle: str = "0"
+    anim_style: str = "auto"
+    anim_speed: int = 480
+
+    def _get_bar_text_props(self) -> dict:
+        """Возвращает единые настройки положения и угла наклона подписей для столбчатых графиков."""
+        pos_mode = str(getattr(self, "bar_text_pos", "outside") or "outside")
+        ang_mode = str(getattr(self, "bar_text_angle", "0") or "0")
+
+        props: dict = {"cliponaxis": False}
+        if pos_mode == "outside":
+            props["textposition"] = "outside"
+        elif pos_mode == "inside":
+            props["textposition"] = "inside"
+            props["insidetextanchor"] = "end"
+        elif pos_mode == "inside_middle":
+            props["textposition"] = "inside"
+            props["insidetextanchor"] = "middle"
+        elif pos_mode == "inside_base":
+            props["textposition"] = "inside"
+            props["insidetextanchor"] = "start"
+        else:
+            props["textposition"] = "auto"
+
+        if ang_mode in ("0", "-90", "-45", "90"):
+            props["textangle"] = int(ang_mode)
+        return props
 
     def _get_col_display_name(self, col_name: str, idx: int = -1) -> str:
         """Возвращает пользовательское имя столбца/легенды, если оно задано в Инспекторе."""
@@ -3864,36 +3904,36 @@ class PlotlyChartBlock(Block):
         pct_mode = str(getattr(self, "slice_pct_mode", "ge") or "ge")
         raw_min = getattr(self, "min_slice_pct", 0.0)
         try:
-            min_pct = float(raw_min) if raw_min is not None and str(raw_min).strip() != "" else 0.0
+            min_pct = float(raw_min)
         except Exception:
             min_pct = 0.0
 
-        # Если фильтр выключен или стоит дефолтный порог 0% в режиме 'ge' — показываем все сектора
-        if pct_mode == "none" or (pct_mode == "ge" and abs(min_pct) < 1e-9):
+        if pct_mode == "none":
             return True
 
-        disp_mode = getattr(self, "pie_value_display", "formula_pct")
-
-        # Определяем, с каким именно процентом сравнивать порог пользователя
+        # По умолчанию берем результат формулы (например, -11.62 или +22.08)
+        val_to_check = float(r_val)
+        
+        # Если пользователь выбрал режим площади или модуля — берем соответствующее значение
         if pct_mode in ("share_ge", "share_le"):
             val_to_check = float(share_pct)
-        elif is_formula_pct and disp_mode != "share_only":
-            if pct_mode in ("abs_ge", "abs_le") or disp_mode == "formula_abs_pct":
-                val_to_check = abs(float(r_val))
-            else:
-                # Точное значение со знаком (например, +22.08% или -11.62%)
-                val_to_check = float(r_val)
-        else:
-            val_to_check = float(share_pct)
+        elif pct_mode in ("abs_ge", "abs_le"):
+            val_to_check = abs(float(r_val))
 
-        if pct_mode in ("ge", "abs_ge", "share_ge"):
+        # Выполняем точную проверку выбранного оператора
+        if pct_mode in ("ge", "share_ge"):
             return val_to_check >= min_pct
         if pct_mode == "gt":
             return val_to_check > min_pct
-        if pct_mode in ("le", "abs_le", "share_le"):
+        if pct_mode in ("le", "share_le"):
             return val_to_check <= min_pct
         if pct_mode == "lt":
             return val_to_check < min_pct
+        if pct_mode == "abs_ge":
+            return val_to_check >= min_pct
+        if pct_mode == "abs_le":
+            return val_to_check <= min_pct
+
         return True
 
     def _calc_waybill_types_overview_slice(
@@ -4245,10 +4285,9 @@ class PlotlyChartBlock(Block):
             default=str,
         )
         if "DataMemoryCache" in globals():
-            cached_entry = DataMemoryCache._render_html_cache.get(self.id)
-            if cached_entry is not None and cached_entry[0] == render_sig:
-                return cached_entry[1]
-
+            cached_html = DataMemoryCache.get_render_html(self.id, render_sig)
+            if cached_html is not None:
+                return cached_html
         if self.row_start > 0 or self.row_limit > 0:
             end_idx = (self.row_start + self.row_limit) if self.row_limit > 0 else len(df)
             df = df.iloc[self.row_start:end_idx]
@@ -4280,6 +4319,14 @@ class PlotlyChartBlock(Block):
             # =========================================================
             # РЕЖИМ КОМБИНИРОВАННОГО ГРАФИКА (НЕСКОЛЬКО ТИПОВ НА ОДНОЙ ОСИ)
             # =========================================================
+            if self.chart_type in ("pie", "donut") and getattr(self, "pie_display_mode", "") in ("dut_two_pies", "dut_single_drill"):
+                final_html = self._render_dut_pct_drill_pie(
+                    work_df, config_dict, plot_div_id, colors_list, actual_font_size, chart_title
+                )
+                if "render_sig" in locals() and "DataMemoryCache" in globals():
+                    DataMemoryCache.set_render_html(self.id, render_sig, final_html, owner_obj=df)
+                return final_html
+
             is_hierarchical_pie = (
                 self.chart_type in ("pie", "donut")
                 and self.data_mode != "rows"
@@ -4442,61 +4489,59 @@ class PlotlyChartBlock(Block):
                 sort_lvl3 = str(getattr(self, "combo_level3_sort", "") or self.sort_by or "value_desc")
                 sort_series_idx = int(getattr(self, "combo_sort_series_idx", 0) or 0)
 
-                def _eval_combo_formula(
-                    expr_str: str,
-                    pt_idx: int,
-                    series_arrays: list[list[float]],
-                    col_arrays: dict[str, list[float]],
-                    cnt_arr: list[float],
-                    cur_series_idx: int = -1,
-                ) -> float:
-                    import math
-                    raw_expr = str(expr_str or "0").strip()
-                    if not raw_expr:
+                def _combo_if_fn(cond, t_val, f_val=0.0):
+                    try:
+                        return float(t_val) if bool(cond) else float(f_val)
+                    except Exception:
                         return 0.0
 
-                    def _if_fn(cond, t_val, f_val=0.0):
-                        try:
-                            return float(t_val) if bool(cond) else float(f_val)
-                        except Exception:
-                            return 0.0
+                _combo_base_env = {
+                    "__builtins__": {},
+                    "abs": abs, "ABS": abs,
+                    "round": round, "ROUND": round,
+                    "min": min, "MIN": min,
+                    "max": max, "MAX": max,
+                    "sqrt": math.sqrt, "SQRT": math.sqrt,
+                    "pow": pow, "POW": pow,
+                    "if": _combo_if_fn, "IF": _combo_if_fn,
+                    "если": _combo_if_fn, "ЕСЛИ": _combo_if_fn,
+                    "_if_call": _combo_if_fn,
+                }
+                _combo_code_cache: dict = {}
 
-                    env = {
-                        "__builtins__": {},
-                        "abs": abs, "ABS": abs,
-                        "round": round, "ROUND": round,
-                        "min": min, "MIN": min,
-                        "max": max, "MAX": max,
-                        "sqrt": math.sqrt, "SQRT": math.sqrt,
-                        "pow": pow, "POW": pow,
-                        "if": _if_fn, "IF": _if_fn,
-                        "если": _if_fn, "ЕСЛИ": _if_fn,
-                        "_if_call": _if_fn,
-                    }
+                def _compile_combo_expr(expr_str: str, sorted_col_keys: tuple[str, ...]):
+                    cache_k = (expr_str, sorted_col_keys)
+                    cached = _combo_code_cache.get(cache_k)
+                    if cached is not None:
+                        return cached
 
-                    # 1. СНАЧАЛА заменяем имена столбцов в скобках [Имя, л] до замены запятых!
+                    raw_expr = str(expr_str or "0").strip()
+                    if not raw_expr:
+                        _combo_code_cache[cache_k] = (None, ())
+                        return None, ()
+
                     expr = raw_expr
-                    for idx_ck, (c_k, c_arr) in enumerate(
-                        sorted(col_arrays.items(), key=lambda x: len(x[0]), reverse=True)
-                    ):
+                    used_toks = []
+                    used_set = set()
+                    for idx_ck, c_k in enumerate(sorted_col_keys):
                         if not c_k:
                             continue
                         tok = f"__CC_{idx_ck}__"
-                        val_c = float(sum(c_arr)) if pt_idx < 0 else (float(c_arr[pt_idx]) if pt_idx < len(c_arr) else 0.0)
-                        env[tok] = val_c
-                        env[f"{tok}_TOTAL"] = float(sum(c_arr)) if c_arr else 0.0
-                        expr = expr.replace(f"[{c_k}]", tok)
+                        if f"[{c_k}]" in expr:
+                            expr = expr.replace(f"[{c_k}]", tok)
+                            used_toks.append((c_k, tok))
+                            used_set.add(idx_ck)
 
-                    for idx_ck, (c_k, c_arr) in enumerate(
-                        sorted(col_arrays.items(), key=lambda x: len(x[0]), reverse=True)
-                    ):
+                    for idx_ck, c_k in enumerate(sorted_col_keys):
                         if not c_k or c_k in ("ФАКТ", "НОРМА", "НОРМАТИВ"):
                             continue
-                        tok = f"__CC_{idx_ck}__"
                         if c_k in expr:
+                            tok = f"__CC_{idx_ck}__"
                             expr = expr.replace(c_k, tok)
+                            if idx_ck not in used_set:
+                                used_toks.append((c_k, tok))
+                                used_set.add(idx_ck)
 
-                    # 2. Теперь безопасно нормализуем математические знаки и убираем знак % после числа
                     expr = (
                         expr.replace(";", ",")
                         .replace("−", "-")
@@ -4507,62 +4552,95 @@ class PlotlyChartBlock(Block):
                     expr = re.sub(r"(\d),(\d)", r"\1.\2", expr)
                     expr = re.sub(r"(\d+(?:\.\d+)?)\s*%", r"\1", expr)
                     expr = expr.replace("[", "").replace("]", "")
+                    expr = re.sub(r"\b(if|IF|если|ЕСЛИ)\s*\(", "_if_call(", expr)
 
-                    # 3. Значения ФАКТ и НОРМАТИВ для текущей группы (или общего итога при pt_idx < 0)
+                    try:
+                        code_obj = compile(expr, "<combo_formula>", "eval")
+                    except Exception:
+                        code_obj = None
+
+                    res = (code_obj, tuple(used_toks))
+                    _combo_code_cache[cache_k] = res
+                    return res
+
+                def _eval_combo_formula_points(
+                    expr_str: str,
+                    pt_indices,
+                    series_arrays: list[list[float]],
+                    col_arrays: dict[str, list[float]],
+                    cnt_arr: list[float],
+                    cur_series_idx: int = -1,
+                ) -> list[float]:
+                    sorted_col_keys = tuple(sorted(col_arrays.keys(), key=len, reverse=True))
+                    code_obj, used_toks = _compile_combo_expr(expr_str, sorted_col_keys)
+                    if code_obj is None:
+                        return [0.0 for _ in pt_indices]
+
                     f_arr = col_arrays.get(a_col_name, col_arrays.get("ФАКТ", []))
                     n_arr = col_arrays.get(b_col_name, col_arrays.get("НОРМА", []))
-
                     a_tot = float(sum(f_arr)) if f_arr else 0.0
                     b_tot = float(sum(n_arr)) if n_arr else 0.0
                     c_tot = float(sum(cnt_arr)) if cnt_arr else 0.0
 
-                    a_val = a_tot if pt_idx < 0 else (float(f_arr[pt_idx]) if pt_idx < len(f_arr) else 0.0)
-                    b_val = b_tot if pt_idx < 0 else (float(n_arr[pt_idx]) if pt_idx < len(n_arr) else 0.0)
-                    c_val = c_tot if pt_idx < 0 else (float(cnt_arr[pt_idx]) if pt_idx < len(cnt_arr) else 0.0)
+                    env = dict(_combo_base_env)
+                    env["A_TOTAL"] = env["ФАКТ_ОБЩИЙ"] = env["А_ОБЩ"] = a_tot
+                    env["B_TOTAL"] = env["НОРМАТИВ_ОБЩИЙ"] = env["НОРМА_ОБЩ"] = env["Б_ОБЩ"] = b_tot
+                    env["COUNT_TOTAL"] = env["КОЛВО_ОБЩ"] = c_tot
 
-                    # Привязываем все варианты написания Факта и Норматива
-                    for f_key in ("ФАКТ", "Факт", "факт", "FACT", "fact", "A", "a", "А", "а"):
-                        env[f_key] = a_val
-                    for n_key in ("НОРМАТИВ", "Норматив", "норматив", "НОРМА", "Норма", "норма", "NORM", "norm", "PLAN", "План", "план", "B", "b", "Б", "б"):
-                        env[n_key] = b_val
+                    used_col_data = []
+                    for c_k, tok in used_toks:
+                        c_arr = col_arrays[c_k]
+                        c_sum = float(sum(c_arr)) if c_arr else 0.0
+                        env[f"{tok}_TOTAL"] = c_sum
+                        used_col_data.append((tok, c_arr, len(c_arr), c_sum))
 
-                    env.update({
-                        "A_TOTAL": a_tot, "B_TOTAL": b_tot,
-                        "ФАКТ_ОБЩИЙ": a_tot, "НОРМАТИВ_ОБЩИЙ": b_tot, "НОРМА_ОБЩ": b_tot,
-                        "А_ОБЩ": a_tot, "Б_ОБЩ": b_tot,
-                        "DIFF": a_val - b_val, "ABS_DIFF": abs(a_val - b_val),
-                        "COUNT": c_val, "КОЛВО": c_val, "COUNT_TOTAL": c_tot, "КОЛВО_ОБЩ": c_tot,
-                    })
-
-                    # 4. Привязываем S1, S2... (если S1/S2 — это формулы, по умолчанию S1=ФАКТ и S2=НОРМАТИВ)
-                    env["S1"] = env["s1"] = a_val
-                    env["S2"] = env["s2"] = b_val
+                    active_series_meta = []
                     for s_i, s_arr in enumerate(series_arrays):
                         if cur_series_idx >= 0 and s_i >= cur_series_idx:
                             continue
                         s_src_type = str(raw_series_list[s_i].get("source_type", "column") or "column") if s_i < len(raw_series_list) else "column"
-                        val_i = float(sum(s_arr)) if pt_idx < 0 else (float(s_arr[pt_idx]) if pt_idx < len(s_arr) else 0.0)
-                        if s_src_type == "column":
-                            env[f"S{s_i + 1}"] = val_i
-                            env[f"s{s_i + 1}"] = val_i
-                            if s_i == 0 and not f_arr:
-                                env["A"] = env["a"] = env["А"] = env["ФАКТ"] = env["Факт"] = env["факт"] = val_i
-                            elif s_i == 1 and not n_arr:
-                                env["B"] = env["b"] = env["Б"] = env["НОРМА"] = env["НОРМАТИВ"] = val_i
-                        elif s_i >= 2:
-                            env[f"S{s_i + 1}"] = val_i
-                            env[f"s{s_i + 1}"] = val_i
+                        if s_src_type == "column" or s_i >= 2:
+                            active_series_meta.append((s_i, s_src_type, s_arr, len(s_arr), float(sum(s_arr)) if s_arr else 0.0))
 
-                    expr = re.sub(r"\b(if|IF|если|ЕСЛИ)\s*\(", "_if_call(", expr)
-                    try:
-                        res = float(eval(expr, {"__builtins__": {}}, env))
-                        return 0.0 if (math.isnan(res) or math.isinf(res)) else res
-                    except ZeroDivisionError:
-                        return 0.0
-                    except Exception:
-                        return 0.0
+                    len_f, len_n, len_c = len(f_arr), len(n_arr), len(cnt_arr)
+                    out = []
+                    for pt_idx in pt_indices:
+                        if pt_idx < 0:
+                            a_val, b_val, c_val = a_tot, b_tot, c_tot
+                            for tok, _arr, _ln, c_sum in used_col_data:
+                                env[tok] = c_sum
+                        else:
+                            a_val = float(f_arr[pt_idx]) if pt_idx < len_f else 0.0
+                            b_val = float(n_arr[pt_idx]) if pt_idx < len_n else 0.0
+                            c_val = float(cnt_arr[pt_idx]) if pt_idx < len_c else 0.0
+                            for tok, arr, ln, _c_sum in used_col_data:
+                                env[tok] = float(arr[pt_idx]) if pt_idx < ln else 0.0
 
-                def _build_combo_traces_for_df(
+                        env["ФАКТ"] = env["Факт"] = env["факт"] = env["FACT"] = env["fact"] = env["A"] = env["a"] = env["А"] = env["а"] = a_val
+                        env["НОРМАТИВ"] = env["Норматив"] = env["норматив"] = env["НОРМА"] = env["Норма"] = env["норма"] = env["NORM"] = env["norm"] = env["PLAN"] = env["План"] = env["план"] = env["B"] = env["b"] = env["Б"] = env["б"] = b_val
+                        env["DIFF"] = a_val - b_val
+                        env["ABS_DIFF"] = abs(a_val - b_val)
+                        env["COUNT"] = env["КОЛВО"] = c_val
+                        env["S1"] = env["s1"] = a_val
+                        env["S2"] = env["s2"] = b_val
+
+                        for s_i, s_src_type, s_arr, s_len, s_sum in active_series_meta:
+                            val_i = s_sum if pt_idx < 0 else (float(s_arr[pt_idx]) if pt_idx < s_len else 0.0)
+                            env[f"S{s_i + 1}"] = env[f"s{s_i + 1}"] = val_i
+                            if s_src_type == "column":
+                                if s_i == 0 and not f_arr:
+                                    env["A"] = env["a"] = env["А"] = env["ФАКТ"] = env["Факт"] = env["факт"] = val_i
+                                elif s_i == 1 and not n_arr:
+                                    env["B"] = env["b"] = env["Б"] = env["НОРМА"] = env["НОРМАТИВ"] = val_i
+
+                        try:
+                            res = float(eval(code_obj, {"__builtins__": {}}, env))
+                            out.append(0.0 if (math.isnan(res) or math.isinf(res)) else res)
+                        except Exception:
+                           out.append(0.0)
+                    return out
+
+                def _build_combo_traces_for_df( 
                     sub_df: pd.DataFrame,
                     x_col_key: str,
                     level_sort_mode: str = "value_desc",
@@ -4593,7 +4671,6 @@ class PlotlyChartBlock(Block):
                     cnt_series = grp_obj.size()
                     cnt_arr = [float(cnt_series.get(xl, 0.0)) for xl in x_labels]
 
-                    # Базовые массивы по всем колонкам таблицы для ВСЕХ категорий уровня
                     col_arrays_map: dict[str, list[float]] = {}
                     for uc, nk in col_to_num_key.items():
                         sum_s = grp_obj[nk].sum()
@@ -4637,22 +4714,20 @@ class PlotlyChartBlock(Block):
                         if c_name:
                             col_arrays_map[c_name] = arr
 
-                    # Шаг 2: Считаем математические формулы по всем категориям
+                    # Шаг 2: Считаем математические формулы по всем категориям (одним батчем)
+                    n_pts = len(x_labels)
                     for idx_s, s_cfg in enumerate(raw_series_list):
                         src_type = str(s_cfg.get("source_type", "column") or "column")
                         agg_fn = str(s_cfg.get("agg", "sum") or "sum")
                         if src_type == "formula" or agg_fn == "formula":
                             f_str = str(s_cfg.get("formula", "ФАКТ - НОРМАТИВ") or "ФАКТ - НОРМАТИВ")
-                            arr = [
-                                _eval_combo_formula(f_str, pt_i, computed_series_arrays, col_arrays_map, cnt_arr, cur_series_idx=idx_s)
-                                for pt_i in range(len(x_labels))
-                            ]
-                            computed_series_arrays[idx_s] = arr
+                            computed_series_arrays[idx_s] = _eval_combo_formula_points(
+                                f_str, range(n_pts), computed_series_arrays, col_arrays_map, cnt_arr, cur_series_idx=idx_s
+                            )
 
                     # Шаг 3: Сортировка категорий ПОСЛЕ расчёта формул
                     if not is_month_axis and fixed_x_order is None and len(x_labels) > 1:
                         target_s_idx = min(max(0, sort_series_idx), max(0, len(computed_series_arrays) - 1))
-                        # Если выбранная серия скрыта, берём первую видимую серию
                         if target_s_idx < len(raw_series_list) and not raw_series_list[target_s_idx].get("visible", True):
                             for vis_i, s_c in enumerate(raw_series_list):
                                 if s_c.get("visible", True):
@@ -4691,7 +4766,6 @@ class PlotlyChartBlock(Block):
                                 cum_a.append(run_v)
                             computed_series_arrays[idx_s] = cum_a
 
-                    # Проверяем, есть ли столбцы на правой оси Y2 и линия на левой оси Y1 (чтобы линия всегда рисовалась ПОВЕРХ столбцов)
                     has_bar_on_y2 = any(
                         s.get("visible", True) and str(s.get("plot_type", "bar")) in ("bar", "cum_bar") and str(s.get("y_axis", "y1")) == "y2"
                         for s in raw_series_list
@@ -4739,7 +4813,7 @@ class PlotlyChartBlock(Block):
                         # Точный расчёт итога в шапке (для формулы % считается от общих сумм выборки)
                         if src_t == "formula":
                             f_str_tot = str(s_cfg.get("formula", "ФАКТ - НОРМАТИВ") or "ФАКТ - НОРМАТИВ")
-                            tot_s = _eval_combo_formula(f_str_tot, -1, computed_series_arrays, col_arrays_map, cnt_arr, cur_series_idx=idx_s)
+                            tot_s = _eval_combo_formula_points(f_str_tot, (-1,), computed_series_arrays, col_arrays_map, cnt_arr, cur_series_idx=idx_s)[0]
                         else:
                             tot_s = sum(y_arr)
 
@@ -4769,7 +4843,7 @@ class PlotlyChartBlock(Block):
                             }
                             if show_lbl and self.value_label_mode != "none":
                                 tr["text"] = txt_arr
-                                tr["textposition"] = "auto"
+                                tr.update(self._get_bar_text_props())
                         else:
                             has_markers = m_size > 0 and p_type != "area"
                             if p_type == "scatter":
@@ -4795,6 +4869,7 @@ class PlotlyChartBlock(Block):
                                 "line": line_dict,
                                 "marker": {"size": max(4, m_size), "color": c_hex},
                                 "hovertemplate": htpl,
+                                "cliponaxis": False,
                             }
                             if p_type == "area":
                                 tr["fill"] = "tozeroy"
@@ -4802,7 +4877,6 @@ class PlotlyChartBlock(Block):
                                 tr["text"] = txt_arr
                                 tr["textposition"] = "top center"
 
-                        # Привязка к левой/правой оси с учётом того, чтобы линия была поверх столбцов
                         if swap_y_layers:
                             if y_ax != "y2":
                                 tr["yaxis"] = "y2"
@@ -4833,13 +4907,12 @@ class PlotlyChartBlock(Block):
                 else:
                     ord_months = []
 
-                custom_all_lbl = str(getattr(self, "all_groups_label", "Все типы ТС") or "Все типы ТС").strip()
+                custom_all_lbl = str(getattr(self, "all_groups_label", "Все категории") or "Все категории").strip()
                 matrix_groups = {}
                 drill3_map = {}
 
                 def _pack_month_slices(df_slice: pd.DataFrame, x_key: str, s_mode: str, title_prefix: str, lvl_idx: int) -> tuple[dict, dict, list[str]]:
                     m_dict, b_dict = {}, {}
-                    # Сохраняем все категории уровня в слепок (apply_top_n=False), чтобы в браузере можно было менять Топ-N и сортировку без потери категорий!
                     tr_full, hdr_all, x_ord = _build_combo_traces_for_df(
                         df_slice, x_key, level_sort_mode=s_mode, level_num=lvl_idx, apply_top_n=False
                     )
@@ -4848,29 +4921,35 @@ class PlotlyChartBlock(Block):
                         "header": f"<b>{_escape(title_prefix)}</b> — Весь период &nbsp;|&nbsp; {hdr_all}",
                     }
                     b_dict["ALL_MONTHS"] = "Весь период"
-                    for m_name in ord_months:
-                        m_sub = df_slice[df_slice["_cmb_month"] == m_name]
-                        tr_m, hdr_m, _ = _build_combo_traces_for_df(
-                            m_sub, x_key, level_sort_mode=s_mode, level_num=lvl_idx, apply_top_n=False
-                        )
-                        m_dict[m_name] = {
-                            "traces": tr_m,
-                            "header": f"<b>{_escape(title_prefix)}</b> — Период: <b>{_escape(m_name)}</b> &nbsp;|&nbsp; {hdr_m}",
-                        }
-                        b_dict[m_name] = m_name
+                    if ord_months:
+                        month_groups = {k: g for k, g in df_slice.groupby("_cmb_month", sort=False)}
+                        for m_name in ord_months:
+                            m_sub = month_groups.get(m_name)
+                            if m_sub is None or len(m_sub) == 0:
+                                tr_m, hdr_m = [], "Нет данных"
+                            else:
+                                tr_m, hdr_m, _ = _build_combo_traces_for_df(
+                                    m_sub, x_key, level_sort_mode=s_mode, level_num=lvl_idx, apply_top_n=False
+                                )
+                            m_dict[m_name] = {
+                                "traces": tr_m,
+                                "header": f"<b>{_escape(title_prefix)}</b> — Период: <b>{_escape(m_name)}</b> &nbsp;|&nbsp; {hdr_m}",
+                            }
+                            b_dict[m_name] = m_name
                     return m_dict, b_dict, x_ord
 
-                # УРОВЕНЬ 1: По типам ТС
+                # УРОВЕНЬ 1
                 l1_months, l1_badges, all_l1_vals = _pack_month_slices(
                     combo_df, "_cmb_l1", sort_lvl1, f"Уровень 1 ({lvl1_col}): {custom_all_lbl}", 1
                 )
                 matrix_groups["ALL"] = {"months": l1_months, "badges": l1_badges, "level": 1, "label": custom_all_lbl}
 
-                # УРОВЕНЬ 2: По моделям ТС внутри каждого типа ТС
+                # УРОВЕНЬ 2 и УРОВЕНЬ 3 (однократная группировка через groupby)
                 if lvl2_col:
+                    l1_groups = {k: g for k, g in combo_df.groupby(combo_df["_cmb_l1"].str.lower(), sort=False)}
                     for l1_val in all_l1_vals[:60]:
-                        l1_df = combo_df[combo_df["_cmb_l1"].str.lower() == l1_val.lower()]
-                        if len(l1_df) == 0:
+                        l1_df = l1_groups.get(l1_val.lower())
+                        if l1_df is None or len(l1_df) == 0:
                             continue
                         l2_months, l2_badges, all_l2_vals = _pack_month_slices(
                             l1_df, "_cmb_l2", sort_lvl2, f"Уровень 2 ({lvl2_col}): {l1_val}", 2
@@ -4883,11 +4962,13 @@ class PlotlyChartBlock(Block):
                             "label": l1_val,
                         }
 
-                        # УРОВЕНЬ 3: По гос. номерам внутри каждой модели ТС
-                        if lvl3_col:
-                            for l2_val in all_l2_vals[:60]:
-                                l2_df = l1_df[l1_df["_cmb_l2"].str.lower() == l2_val.lower()]
-                                if len(l2_df) == 0:
+                        if lvl3_col and len(drill3_map) < 300:
+                            l2_groups = {k: g for k, g in l1_df.groupby(l1_df["_cmb_l2"].str.lower(), sort=False)}
+                            for l2_val in all_l2_vals[:30]:
+                                if len(drill3_map) >= 300:
+                                    break
+                                l2_df = l2_groups.get(l2_val.lower())
+                                if l2_df is None or len(l2_df) == 0:
                                     continue
                                 l3_months, l3_badges, _ = _pack_month_slices(
                                     l2_df, "_cmb_l3", sort_lvl3, f"Уровень 3 ({lvl3_col}): {l1_val} → {l2_val}", 3
@@ -4922,8 +5003,8 @@ class PlotlyChartBlock(Block):
                     "has_lvl2": bool(lvl2_col),
                     "has_lvl3": bool(lvl2_col and lvl3_col),
                     "lvl1_title": lvl1_col,
-                    "lvl2_title": lvl2_col or "Модель ТС",
-                    "lvl3_title": lvl3_col or "Гос. номер",
+                    "lvl2_title": lvl2_col or "Подкатегория",
+                    "lvl3_title": lvl3_col or "Объект / ID",
                     "sort_lvl1": sort_lvl1,
                     "sort_lvl2": sort_lvl2,
                     "sort_lvl3": sort_lvl3,
@@ -5476,7 +5557,7 @@ class PlotlyChartBlock(Block):
                 )
 
                 xy_df["_grp_clean"] = (
-                    DataMemoryCache.get_str_series(xy_df, p_col) if p_col else "Все типы ТС"
+                    DataMemoryCache.get_str_series(xy_df, p_col) if p_col else "Все категории"
                 )
                 xy_df["_sub_clean"] = (
                     DataMemoryCache.get_str_series(xy_df, m_col) if m_col else xy_df["_grp_clean"]
@@ -5504,7 +5585,7 @@ class PlotlyChartBlock(Block):
                     self._get_col_display_name(mc, idx_m) for idx_m, mc in enumerate(metric_cols)
                 ]
                 use_grp_prefix = bool(getattr(self, "prefix_legend_with_group", False))
-                custom_all_label = str(getattr(self, "all_groups_label", "Итого (Все типы ТС)") or "").strip()
+                custom_all_label = str(getattr(self, "all_groups_label", "Итого (Все категории)") or "").strip()
 
                 def _make_multi_xy_traces(x_vals: list[str], series_matrix: list[list[float]], grp_title: str, is_cumulative: bool = False) -> list[dict]:
                     traces = []
@@ -5554,7 +5635,12 @@ class PlotlyChartBlock(Block):
                             }
                             if self.show_values and self.value_label_mode != "none":
                                 tr["text"] = [f"{v:,.0f}" if abs(v) > 0 else "" for v in y_arr]
-                                tr["textposition"] = "inside" if self.chart_type in ("bar_stacked", "bar_cumulative", "bar_stacked_100") else "auto"
+                                if self.chart_type in ("bar_stacked", "bar_cumulative", "bar_stacked_100"):
+                                    tr["textposition"] = "inside"
+                                    if getattr(self, "bar_text_angle", "0") in ("0", "-90", "-45"):
+                                        tr["textangle"] = int(getattr(self, "bar_text_angle", "0"))
+                                else:
+                                    tr.update(self._get_bar_text_props())
                         traces.append(tr)
                     return traces
 
@@ -5577,16 +5663,16 @@ class PlotlyChartBlock(Block):
                         grand_total += col_tot
                         summary_parts.append(f"{disp_lbl}: <b>{col_tot:,.1f}</b>")
 
+                    tot_lbl = str(getattr(self, "summary_total_label", "Σ Итого") or "").strip()
+                    show_tot = bool(getattr(self, "show_summary_total", False))
+                    tot_suffix_all = f" &nbsp;|&nbsp; {_escape(tot_lbl)}: <b style='color:#003F0B;'>{grand_total:,.1f}</b>" if show_tot and tot_lbl else ""
+
                     hdr_prefix = f"<b>{grp_caption}</b> — Весь период &nbsp;|&nbsp; " if grp_caption else "<b>Весь период</b> &nbsp;|&nbsp; "
                     m_dict["ALL_MONTHS"] = {
                         "traces": _make_multi_xy_traces(ordered_months, series_by_m, grp_caption, is_cumulative=is_cum_mode),
-                        "header": (
-                            hdr_prefix
-                            + " &nbsp;|&nbsp; ".join(summary_parts)
-                            + f" &nbsp;|&nbsp; Σ Итого: <b style='color:#003F0B;'>{grand_total:,.1f}</b>"
-                        ),
+                        "header": hdr_prefix + " &nbsp;|&nbsp; ".join(summary_parts) + tot_suffix_all,
                     }
-                    b_dict["ALL_MONTHS"] = f"Весь период ({grand_total:,.0f})"
+                    b_dict["ALL_MONTHS"] = "Весь период"
 
                     for m_name in ordered_months:
                         m_slice = sub_df[sub_df["_month_name"] == m_name]
@@ -5607,16 +5693,14 @@ class PlotlyChartBlock(Block):
                             cat_names = [m_name]
                             cat_series = [[float(getattr(m_slice[k_name], agg_method)()) if len(m_slice) > 0 else 0.0] for k_name in num_keys]
 
+                        tot_suffix_m = f" &nbsp;|&nbsp; {_escape(tot_lbl)}: <b style='color:#003F0B;'>{m_grand:,.1f}</b>" if show_tot and tot_lbl else ""
                         m_hdr_prefix = f"<b>{grp_caption}</b> — Период: <b>{m_name}</b> &nbsp;|&nbsp; " if grp_caption else f"Период: <b>{m_name}</b> &nbsp;|&nbsp; "
                         m_dict[m_name] = {
                             "traces": _make_multi_xy_traces(cat_names, cat_series, f"{grp_caption} — {m_name}" if grp_caption else m_name, is_cumulative=False),
-                            "header": (
-                                m_hdr_prefix
-                                + " &nbsp;|&nbsp; ".join(m_summary_parts)
-                                + f" &nbsp;|&nbsp; Σ: <b style='color:#003F0B;'>{m_grand:,.1f}</b>"
-                            ),
+                            "header": m_hdr_prefix + " &nbsp;|&nbsp; ".join(m_summary_parts) + tot_suffix_m,
                         }
-                        b_dict[m_name] = f"{m_name} ({m_grand:,.0f})"
+
+                        b_dict[m_name] = m_name
 
                     return m_dict, b_dict
 
@@ -5886,14 +5970,14 @@ class PlotlyChartBlock(Block):
                         s_name = f"Итого ({suf})" if suf != "Значение" and len(metric_groups) > 1 else "Итого (Сумма)"
                         m_name = f"Среднее ({suf})" if suf != "Значение" and len(metric_groups) > 1 else "Среднее"
 
-                        t_type = self.chart_type
+                        is_bar_row = self.chart_type in ("bar", "bar_stacked", "bar_cumulative", "bar_stacked_100")
                         trace_base = {
-                            "type": "scatter" if t_type != "bar" else "bar",
-                            "mode": "lines+markers" if t_type != "bar" else None,
+                            "type": "bar" if is_bar_row else "scatter",
                             "marker": {"color": c_hex},
                             "hovertemplate": hover_tpl,
                         }
-                        if t_type != "bar":
+                        if not is_bar_row:
+                            trace_base["mode"] = "lines+markers"
                             trace_base["line"] = {"width": 4, "color": c_hex}
 
                         sum_traces.append({**trace_base, "name": s_name, "x": x_months, "y": sum_y})
@@ -6148,27 +6232,53 @@ class PlotlyChartBlock(Block):
             text_color = "#f0f4f8" if is_dark else "#333333"
             grid_color = "#334155" if is_dark else "#e2e8f0"
 
+            is_pie_layout = self.chart_type in ("pie", "donut")
+
+            # Вычисляем максимальную длину подписи оси X, чтобы нижняя легенда никогда не наезжала на текст
+            max_x_label_len = 0
+            if fig is not None and not is_pie_layout:
+                for tr_obj in fig.data:
+                    x_seq = getattr(tr_obj, "x", None)
+                    if x_seq is not None:
+                        for xv in x_seq:
+                            max_x_label_len = max(max_x_label_len, len(str(xv or "")))
+
+            extra_bottom_px = max(0, (max_x_label_len - 12) * 3) if not is_pie_layout else 0
+            raw_mh = int(config_dict.get("min_height", getattr(self, "min_height", 0)) or 0)
+            base_default_h = 380 if is_pie_layout else (380 + (45 if self.legend_pos == "bottom" else 0) + extra_bottom_px // 2)
+            target_chart_height = raw_mh if raw_mh >= 180 else base_default_h
+
+            leg_bg = "rgba(30, 41, 59, 0.85)" if is_dark else "rgba(255, 255, 255, 0.88)"
             legend_config = dict(
                 title_text="",
                 visible=bool(self.show_legend),
                 font=dict(family="Segoe UI, sans-serif", size=actual_font_size, color=text_color),
+                bgcolor=leg_bg,
                 itemsizing="constant",
                 x=1.02, y=1.0, xanchor="left", yanchor="top",
             )
             if self.legend_pos == "top":
-                legend_config.update(dict(orientation="h", yanchor="bottom", y=1.12, xanchor="center", x=0.5))
+                legend_config.update(dict(orientation="h", yanchor="bottom", y=1.14, xanchor="center", x=0.5))
             elif self.legend_pos == "bottom":
-                legend_config.update(dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5))
+                if is_pie_layout:
+                    legend_config.update(dict(orientation="h", yanchor="top", y=-0.12, xanchor="center", x=0.5))
+                else:
+                    # Автоматически опускаем легенду ниже самых длинных наклонных подписей оси X
+                    plot_h_est = max(180.0, float(target_chart_height - 130))
+                    label_drop_px = 42.0 + max_x_label_len * 2.35 + (20.0 if x_axis_caption else 0.0)
+                    y_bottom_pos = -min(0.68, max(0.30, label_drop_px / plot_h_est))
+                    legend_config.update(dict(orientation="h", yanchor="top", y=round(y_bottom_pos, 3), xanchor="center", x=0.5))
 
-            is_pie_layout = self.chart_type in ("pie", "donut")
+            top_m = 88 if (self.title and self.show_title) else 58
+            if self.legend_pos == "top":
+                top_m += 26
+            bot_m = 65 + extra_bottom_px + (48 if self.legend_pos == "bottom" else 0)
+
             chart_margins = (
-                dict(l=20, r=20, t=40 if (self.title and self.show_title) else 12, b=16)
+                dict(l=20, r=20, t=40 if (self.title and self.show_title) else 12, b=45 if self.legend_pos == "bottom" else 16)
                 if is_pie_layout
-                else dict(l=45, r=50, t=75 if (self.title and self.show_title) else 50, b=65)
+                else dict(l=50, r=55, t=top_m, b=bot_m)
             )
-
-            raw_mh = int(config_dict.get("min_height", getattr(self, "min_height", 0)) or 0)
-            target_chart_height = raw_mh if raw_mh >= 180 else (380 if is_pie_layout else 340)
 
             if fig is not None:
                 fig.update_layout(
@@ -6301,11 +6411,11 @@ class PlotlyChartBlock(Block):
                 hdr_fs = max(13, actual_font_size)
                 drill_bar_html = ""
                 if row_slicer_payload.get("__is_combo_drill__"):
-                    l1_t = _escape(str(row_slicer_payload.get("lvl1_title", "Тип ТС")))
+                    l1_t = _escape(str(row_slicer_payload.get("lvl1_title", "Группа")))
                     init_s = _escape(str(row_slicer_payload.get("sort_lvl1", "value_desc")))
                     init_top = int(row_slicer_payload.get("top_n", 12) or 0)
                     drill_bar_html = f"""
-                    <div id="{plot_div_id}-drillbar" style="display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; padding:6px 12px; background:#f1f5f9; border-radius:6px; border:1px solid #cbd5e1;">
+                    <div id="{plot_div_id}-drillbar" style="display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; padding:6px 40px 6px 12px; background:#f1f5f9; border-radius:6px; border:1px solid #cbd5e1;">
                         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
                             <button type="button" id="{plot_div_id}-back-btn"
                                     onclick="window.stepBackComboDrill('{plot_div_id}')"
@@ -6435,6 +6545,8 @@ class PlotlyChartBlock(Block):
                             }}
                         }}
                         if (!grpObj) return;
+                        var prevLevel = plotDiv._activeLevel || 1;
+                        var animDir = (activeLevel > prevLevel) ? 'drill-in' : ((activeLevel < prevLevel) ? 'drill-out' : 'auto');
                         plotDiv._activeLevel = activeLevel;
 
                         if (rowMap.__is_combo_drill__) {{
@@ -6445,11 +6557,11 @@ class PlotlyChartBlock(Block):
                             if (backBtn) backBtn.style.display = (activeLevel > 1) ? 'inline-block' : 'none';
                             if (crumbEl) {{
                                 if (activeLevel === 1) {{
-                                    crumbEl.innerHTML = '📊 Уровень 1 (' + (rowMap.lvl1_title || 'Тип ТС') + '): Все категории';
+                                    crumbEl.innerHTML = '📊 Уровень 1 (' + (rowMap.lvl1_title || 'Группа') + '): Все категории';
                                 }} else if (activeLevel === 2) {{
-                                    crumbEl.innerHTML = '📊 ' + curGroup + ' ➔ 📂 Уровень 2 (' + (rowMap.lvl2_title || 'Модель ТС') + ')';
+                                    crumbEl.innerHTML = '📊 ' + curGroup + ' ➔ 📂 Уровень 2 (' + (rowMap.lvl2_title || 'Подкатегория') + ')';
                                 }} else {{
-                                    crumbEl.innerHTML = '📊 ' + curGroup + ' ➔ 📂 ' + curSubGroup + ' ➔ 🚗 Уровень 3 (' + (rowMap.lvl3_title || 'Гос. номер') + ')';
+                                    crumbEl.innerHTML = '📊 ' + curGroup + ' ➔ 📂 ' + curSubGroup + ' ➔ 🏷 Уровень 3 (' + (rowMap.lvl3_title || 'Объект / ID') + ')';
                                 }}
                             }}
                             plotDiv._levelSortOverrides = plotDiv._levelSortOverrides || {{
@@ -6493,7 +6605,11 @@ class PlotlyChartBlock(Block):
 
                         var hdrEl = document.getElementById(plotDiv.id + '-hdr');
                         if (hdrEl && mEntry.header) {{
-                            hdrEl.innerHTML = mEntry.header;
+                            if (typeof window._eaUpdateHeaderAnimated === 'function') {{
+                                window._eaUpdateHeaderAnimated(hdrEl, mEntry.header);
+                            }} else {{
+                                hdrEl.innerHTML = mEntry.header;
+                            }}
                         }}
                         var clonedTraces = JSON.parse(JSON.stringify(mEntry.traces));
                         if (rowMap.__is_combo_drill__ && plotDiv._levelSortOverrides) {{
@@ -6502,31 +6618,10 @@ class PlotlyChartBlock(Block):
                             clonedTraces = window._sortAndSliceComboTraces(clonedTraces, activeSort, rowMap.sort_series_idx || 0, activeTop);
                         }}
 
-                        var isPieChart = clonedTraces.some(function(t) {{
-                            return t.type === 'pie' || t.type === 'treemap' || t.type === 'sunburst';
-                        }});
-
-                        if (isPieChart) {{
-                            if (plotDiv.layout) delete plotDiv.layout.transition;
-                            Plotly.react(plotDiv, clonedTraces, plotDiv.layout);
+                        if (typeof window._eaAnimatedPlotlyReact === 'function') {{
+                            window._eaAnimatedPlotlyReact(plotDiv, clonedTraces, animDir);
                         }} else {{
-                            if (plotDiv.layout) {{
-                                delete plotDiv.layout.transition;
-                                if (plotDiv.layout.xaxis) {{
-                                    delete plotDiv.layout.xaxis.range;
-                                    plotDiv.layout.xaxis.autorange = true;
-                                }}
-                                if (plotDiv.layout.yaxis) {{
-                                    delete plotDiv.layout.yaxis.range;
-                                    plotDiv.layout.yaxis.autorange = true;
-                                }}
-                                if (plotDiv.layout.yaxis2) {{
-                                    delete plotDiv.layout.yaxis2.range;
-                                    plotDiv.layout.yaxis2.autorange = true;
-                                }}
-                            }}
                             Plotly.react(plotDiv, clonedTraces, plotDiv.layout);
-                            Plotly.relayout(plotDiv, {{ 'xaxis.autorange': true, 'yaxis.autorange': true, 'yaxis2.autorange': true }});
                         }}
                     }};
 
@@ -6605,11 +6700,29 @@ class PlotlyChartBlock(Block):
                 </script>
                 """
 
+        card_caption = _escape(str(self.title or "График данных").strip() or "График данных")
+        a_style = _escape(str(getattr(self, "anim_style", "auto") or "auto"))
+        a_speed = int(getattr(self, "anim_speed", 480) or 480)
         inner = f"""
+        {_CHART_ANIM_ASSETS_HTML}
         <div class="block" style="width:100%; min-width:0; max-width:100%;">
-            <div class="block-card" style="width:100%; padding: 16px; background: {self.bg_color}; border-radius: 8px; min-width:0; max-width:100%; box-sizing: border-box;">
-                {matrix_controls_html}
-                {chart_div}
+            <div class="block-card ea-chart-card" id="{plot_div_id}-card"
+                 data-anim-style="{a_style}" data-anim-speed="{a_speed}"
+                 style="width:100%; padding: 16px; background: {self.bg_color}; border-radius: 8px; min-width:0; max-width:100%; box-sizing: border-box; --ea-anim-dur:{a_speed}ms;">
+                <div class="ea-chart-topbar"
+                     onclick="if (this.parentElement.classList.contains('ea-collapsed')) window.toggleEaChartCard('{plot_div_id}', event)">
+                    <span class="ea-chart-collapsed-title">📊 {card_caption}<span class="ea-chart-collapsed-hint">(нажмите, чтобы развернуть)</span></span>
+                    <button type="button" class="ea-chart-toggle-btn" title="Свернуть график"
+                            onclick="window.toggleEaChartCard('{plot_div_id}', event)">
+                        <span class="ea-toggle-icon">▾</span>
+                    </button>
+                </div>
+                <div class="ea-chart-collapsible" id="{plot_div_id}-body">
+                    <div class="ea-chart-collapsible-inner">
+                        {matrix_controls_html}
+                        {chart_div}
+                    </div>
+                </div>
                 {slicer_json_script}
             </div>
         </div>
@@ -6618,7 +6731,1034 @@ class PlotlyChartBlock(Block):
         if "render_sig" in locals() and "DataMemoryCache" in globals():
             DataMemoryCache._render_html_cache[self.id] = (render_sig, final_html)
         return final_html
-    
+
+    def _render_dut_pct_drill_pie(
+        self,
+        work_df: pd.DataFrame,
+        config_dict: dict,
+        plot_div_id: str,
+        colors_list: list[str],
+        actual_font_size: int,
+        chart_title: str,
+    ) -> str:
+        """Интерактивная круговая диаграмма с живыми фильтрами ДУТ + % отклонения и 3-уровневым погружением."""
+        cols_all = [str(c) for c in work_df.columns]
+        num_cands = [str(c) for c in work_df.select_dtypes(include="number").columns]
+        str_cands = [c for c in cols_all if c not in num_cands]
+
+        def _parse_pct(s: pd.Series) -> pd.Series:
+            s = _ensure_series(s)
+            if pd.api.types.is_numeric_dtype(s):
+                return s.fillna(0.0).astype(float)
+            cleaned = (
+                s.astype(str)
+                .str.replace("%", "", regex=False)
+                .str.replace("\u00a0", "", regex=False)
+                .str.replace(" ", "", regex=False)
+                .str.replace(",", ".", regex=False)
+            )
+            return pd.to_numeric(cleaned, errors="coerce").fillna(0.0).astype(float)
+
+        # 1. Определяем колонки (выбранные в Инспекторе или автопоиском)
+        dut_col = self.dut_col if (self.dut_col and self.dut_col in work_df.columns) else ""
+        if not dut_col:
+            for c in cols_all:
+                if "дут" in c.lower():
+                    dut_col = c
+                    break
+
+        pct_col = self.pct_col if (self.pct_col and self.pct_col in work_df.columns) else ""
+        if not pct_col and not (self.fact_col and self.norm_col):
+            for c in cols_all:
+                cl = c.lower()
+                if "%" in cl or "процент" in cl or ("перерасход" in cl and ("%" in cl or "проц" in cl)):
+                    pct_col = c
+                    break
+
+        fact_col = self.fact_col if (self.fact_col and self.fact_col in work_df.columns) else ""
+        norm_col = self.norm_col if (self.norm_col and self.norm_col in work_df.columns) else ""
+        has_fact_norm = bool(fact_col and norm_col)
+
+        type_col = self.parent_group_col if (self.parent_group_col and self.parent_group_col in work_df.columns) else ""
+        if not type_col:
+            for c in str_cands:
+                if c != dut_col and any(w in c.lower() for w in ("тип", "групп", "категор")):
+                    type_col = c
+                    break
+            if not type_col:
+                type_col = self.x_col if (self.x_col and self.x_col in work_df.columns and self.x_col != dut_col) else (str_cands[0] if str_cands else cols_all[0])
+
+        model_col = self.model_col if (self.model_col and self.model_col in work_df.columns and self.model_col != type_col) else ""
+        if not model_col:
+            for c in str_cands:
+                if c not in (dut_col, type_col) and any(w in c.lower() for w in ("модел", "марк", "авто")):
+                    model_col = c
+                    break
+
+        plate_col = self.plate_col if (self.plate_col and self.plate_col in work_df.columns and self.plate_col not in (type_col, model_col)) else ""
+        if not plate_col:
+            for c in cols_all:
+                if c not in (dut_col, type_col, model_col, pct_col, fact_col, norm_col) and any(w in c.lower() for w in ("гос", "номер", "грз", "вин")):
+                    plate_col = c
+                    break
+
+        date_col = self.date_col if (self.date_col and self.date_col in work_df.columns) else ""
+
+        if not dut_col and not pct_col and not has_fact_norm:
+            return self.wrap_layout(
+                self._render_empty("Выберите в Инспекторе колонку «Оснащён ДУТ?» и «Процент отклонения» (или Факт/Норматив)")
+            )
+
+        # 2. Подготавливаем компактный датафрейм для мгновенного пересчёта в браузере
+        df_tmp = pd.DataFrame(index=work_df.index)
+        df_tmp["_dut"] = (
+            DataMemoryCache.get_str_series(work_df, dut_col).replace("", "Не указано")
+            if dut_col else "Все"
+        )
+        df_tmp["_type"] = (
+            DataMemoryCache.get_str_series(work_df, type_col).replace("", "Не указано")
+            if type_col else "Все типы"
+        )
+        df_tmp["_model"] = (
+            DataMemoryCache.get_str_series(work_df, model_col).replace("", "Не указано")
+            if model_col else ""
+        )
+        df_tmp["_plate"] = (
+            DataMemoryCache.get_str_series(work_df, plate_col).replace("", "Не указано")
+            if plate_col else ""
+        )
+
+        ordered_months: list[str] = []
+        if date_col:
+            m_names, m_nums = _extract_month_info(work_df[date_col])
+            df_tmp["_month"] = m_names
+            df_tmp["_mnum"] = m_nums
+            valid_m = df_tmp[df_tmp["_month"] != ""]
+            if len(valid_m) > 0:
+                df_tmp = valid_m.copy()
+                ordered_months = (
+                    df_tmp[["_mnum", "_month"]]
+                    .drop_duplicates()
+                    .sort_values(by=["_mnum", "_month"])["_month"]
+                    .tolist()
+                )
+            else:
+                df_tmp["_month"] = ""
+        else:
+            df_tmp["_month"] = ""
+
+        df_tmp["_fact"] = _to_num_series(work_df.loc[df_tmp.index, fact_col]) if has_fact_norm else 0.0
+        df_tmp["_norm"] = _to_num_series(work_df.loc[df_tmp.index, norm_col]) if has_fact_norm else 0.0
+
+        use_pct_col = bool(pct_col)
+        if use_pct_col:
+            raw_pct_col = _ensure_series(work_df.loc[df_tmp.index, pct_col])
+            pct_s = _parse_pct(raw_pct_col)
+            nz = pct_s[pct_s.abs() > 1e-9]
+            # Автоперевод Excel-процентов из долей (0.03 -> 3.0%)
+            if len(nz) > 0 and pd.api.types.is_numeric_dtype(raw_pct_col):
+                if has_fact_norm:
+                    valid_n = df_tmp["_norm"].abs() > 1e-9
+                    if valid_n.any():
+                        calc_p = ((df_tmp.loc[valid_n, "_fact"] - df_tmp.loc[valid_n, "_norm"]) / df_tmp.loc[valid_n, "_norm"] * 100.0).abs()
+                        if float(nz.abs().quantile(0.9)) <= 1.5 and float(calc_p.quantile(0.9)) > 2.0:
+                            pct_s = pct_s * 100.0
+                elif float(nz.abs().quantile(0.9)) <= 1.0 and float((nz.abs() < 1.0).mean()) >= 0.85:
+                    pct_s = pct_s * 100.0
+            df_tmp["_pct"] = pct_s
+        else:
+            df_tmp["_pct"] = 0.0
+
+        df_tmp["_cnt"] = 1
+
+        # Группируем для компактности JSON: если есть Гос. номер — по каждой машине и месяцу; иначе с округлением % до 0.1
+        if plate_col:
+            grp_keys = ["_dut", "_type", "_model", "_plate", "_month"]
+            agg_df = df_tmp.groupby(grp_keys, as_index=False, sort=False).agg(
+                _fact=("_fact", "sum"),
+                _norm=("_norm", "sum"),
+                _pct_sum=("_pct", "sum"),
+                _cnt=("_cnt", "sum"),
+            )
+        else:
+            df_tmp["_pct_r"] = df_tmp["_pct"].round(1)
+            grp_keys = ["_dut", "_type", "_model", "_plate", "_month", "_pct_r"]
+            agg_df = df_tmp.groupby(grp_keys, as_index=False, sort=False).agg(
+                _fact=("_fact", "sum"),
+                _norm=("_norm", "sum"),
+                _pct_sum=("_pct", "sum"),
+                _cnt=("_cnt", "sum"),
+            )
+
+        # Порядок значений ДУТ: сначала «Да», потом «Нет», затем остальные
+        raw_duts = [str(v) for v in agg_df["_dut"].unique().tolist() if str(v)]
+        def _dut_sort_key(v: str):
+            vl = v.strip().lower()
+            if vl in ("да", "yes", "1", "true", "есть", "оборудован"):
+                return (0, v)
+            if vl in ("нет", "no", "0", "false", "не оборудован"):
+                return (1, v)
+            return (2, v.lower())
+        ordered_duts = sorted(raw_duts, key=_dut_sort_key)
+
+        dict_dut = ordered_duts
+        dict_type = sorted(agg_df["_type"].unique().tolist())
+        dict_model = sorted(agg_df["_model"].unique().tolist())
+        dict_plate = sorted(agg_df["_plate"].unique().tolist())
+        dict_month = ordered_months if ordered_months else [""]
+
+        idx_dut = {v: i for i, v in enumerate(dict_dut)}
+        idx_type = {v: i for i, v in enumerate(dict_type)}
+        idx_model = {v: i for i, v in enumerate(dict_model)}
+        idx_plate = {v: i for i, v in enumerate(dict_plate)}
+        idx_month = {v: i for i, v in enumerate(dict_month)}
+
+        compact_rows = [
+            [
+                idx_dut.get(v_dut, 0),
+                idx_type.get(v_type, 0),
+                idx_model.get(v_model, 0),
+                idx_plate.get(v_plate, 0),
+                idx_month.get(v_month, 0),
+                round(float(v_fact), 2),
+                round(float(v_norm), 2),
+                round(float(v_pct_sum), 3),
+                int(v_cnt),
+            ]
+            for v_dut, v_type, v_model, v_plate, v_month, v_fact, v_norm, v_pct_sum, v_cnt in agg_df[
+                ["_dut", "_type", "_model", "_plate", "_month", "_fact", "_norm", "_pct_sum", "_cnt"]
+            ].itertuples(index=False, name=None)
+        ]
+
+        display_mode = str(getattr(self, "pie_display_mode", "dut_two_pies") or "dut_two_pies")
+        init_op = str(getattr(self, "dut_pct_op", "gt") or "gt")
+        try:
+            init_val = float(getattr(self, "dut_pct_val", 3.0) if getattr(self, "dut_pct_val", None) is not None else 3.0)
+        except Exception:
+            init_val = 3.0
+        init_cnt_mode = str(getattr(self, "dut_count_mode", "unique_ts") or "unique_ts")
+        if not plate_col:
+            init_cnt_mode = "rows"
+
+        raw_mh = int(config_dict.get("min_height", getattr(self, "min_height", 0)) or 0)
+        chart_h = raw_mh if raw_mh >= 280 else 390
+
+        payload = {
+            "mode": display_mode,
+            "hole": 0.46 if self.chart_type == "donut" else 0.0,
+            "colors": colors_list,
+            "bg_color": self.bg_color or "#ffffff",
+            "font_size": actual_font_size,
+            "height": chart_h,
+            "show_legend": bool(self.show_legend),
+            "show_values": bool(self.show_values),
+            "top_n": int(self.top_n or 15),
+            "dut_values": ordered_duts,
+            "months": ordered_months,
+            "has_plate": bool(plate_col),
+            "has_model": bool(model_col),
+            "has_fn": has_fact_norm,
+            "use_pct_col": use_pct_col,
+            "labels": {
+                "dut": " ".join(str(dut_col or "Признак").split()),
+                "pct": " ".join(str(pct_col or "Показатель, %").split()),
+                "type": " ".join(str(type_col or "Группа").split()),
+                "model": " ".join(str(model_col or "Подкатегория").split()),
+                "plate": " ".join(str(plate_col or "Объект / ID").split()),
+            },
+            "init": {
+                "dut": "ALL",
+                "op": init_op,
+                "val": init_val,
+                "count_mode": init_cnt_mode,
+            },
+            "dict_dut": dict_dut,
+            "dict_type": dict_type,
+            "dict_model": dict_model,
+            "dict_plate": dict_plate,
+            "dict_month": dict_month,
+            "rows": compact_rows,
+        }
+
+        uid = plot_div_id
+        payload_json = json.dumps(payload, ensure_ascii=False)
+
+        dut_btns_html = [
+            f'<button type="button" class="ea-dut-btn" data-dut="ALL" '
+            f'style="padding:5px 12px; border:1px solid #87C800; border-radius:6px; background:#87C800; color:#fff; font-weight:700; font-size:12px; cursor:pointer;">Все</button>'
+        ]
+        for dv in ordered_duts:
+            safe_dv = _escape(dv)
+            dut_btns_html.append(
+                f'<button type="button" class="ea-dut-btn" data-dut="{safe_dv}" '
+                f'style="padding:5px 12px; border:1px solid #87C800; border-radius:6px; background:#f8fafc; color:#334155; font-weight:600; font-size:12px; cursor:pointer;">{safe_dv}</button>'
+            )
+
+        month_bar_html = ""
+        if len(ordered_months) > 1:
+            m_btns = [
+                '<button type="button" class="ea-pie-month-btn ea-dut-mbtn" data-month="ALL" '
+                'style="padding:5px 11px; border:1px solid #87C800; border-radius:6px; background:#87C800; color:#fff; font-weight:700; font-size:12px; cursor:pointer;">Весь период</button>'
+            ]
+            for mn in ordered_months:
+                safe_mn = _escape(mn)
+                m_btns.append(
+                    f'<button type="button" class="ea-pie-month-btn ea-dut-mbtn" data-month="{safe_mn}" '
+                    f'style="padding:5px 11px; border:1px solid #87C800; border-radius:6px; background:#f8fafc; color:#334155; font-weight:500; font-size:12px; cursor:pointer;">{safe_mn}</button>'
+                )
+            month_bar_html = f'<div id="{uid}-mbar" style="display:flex; flex-wrap:wrap; gap:6px; justify-content:center; margin-bottom:10px;">{"".join(m_btns)}</div>'
+
+        count_mode_html = ""
+        if plate_col:
+            sel_ts = "selected" if init_cnt_mode == "unique_ts" else ""
+            sel_rw = "selected" if init_cnt_mode != "unique_ts" else ""
+            count_mode_html = (
+                f'<div style="display:flex; align-items:center; gap:6px;">'
+                f'<span style="font-size:12px; color:#475569; font-weight:600;">Считать:</span>'
+                f'<select id="{uid}-cnt-sel" style="padding:4px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:12px; background:#fff; color:#1e293b; font-weight:600; cursor:pointer;">'
+                f'<option value="unique_ts" {sel_ts}>🏷 Уникальные объекты</option>'
+                f'<option value="rows" {sel_rw}>📄 Все записи</option>'
+                f'</select></div>'
+            )
+
+        title_html = (
+            f'<div style="font-size:{actual_font_size + 3}px; font-weight:700; color:#003F0B; margin-bottom:10px; text-align:center;">{_escape(chart_title)}</div>'
+            if chart_title else ""
+        )
+
+        if display_mode == "dut_two_pies":
+            charts_area_html = f'''
+            <div style="display:flex; flex-wrap:wrap; gap:16px; align-items:stretch; width:100%;">
+                <div style="flex:1 1 360px; min-width:300px; border:1px solid #e2e8f0; border-radius:8px; padding:12px; background:#ffffff; box-sizing:border-box;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:6px;">
+                        <div id="{uid}-p1-title" style="font-size:13px; font-weight:700; color:#003F0B;">1. Сводка по признаку и порогу</div>
+                        <label style="font-size:11.5px; color:#475569; cursor:pointer; display:flex; align-items:center; gap:4px;">
+                            <input type="checkbox" id="{uid}-show-rest" checked style="cursor:pointer;" /> Показать остаток (в норме)
+                        </label>
+                    </div>
+                    <div id="{uid}-p1-hdr" style="font-size:12px; color:#334155; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:6px 10px; margin-bottom:6px; text-align:center;"></div>
+                    <div id="{uid}-pie1" style="width:100%; height:{chart_h}px;"></div>
+                </div>
+                <div style="flex:1.15 1 400px; min-width:300px; border:1px solid #e2e8f0; border-radius:8px; padding:12px; background:#ffffff; box-sizing:border-box;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:6px;">
+                        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                            <button type="button" id="{uid}-back-btn" style="display:none; padding:4px 10px; border:1px solid #003F0B; border-radius:5px; background:#003F0B; color:#fff; font-weight:700; font-size:11.5px; cursor:pointer;">⬅ На уровень выше</button>
+                            <span id="{uid}-crumb" style="font-size:13px; font-weight:700; color:#003F0B;">Уровень 0: Признак и порог</span>
+                        </div>
+                        <button type="button" id="{uid}-reset-pin" style="display:none; padding:3px 8px; border:1px solid #fecdd3; border-radius:5px; background:#fff1f2; color:#e11d48; font-size:11px; font-weight:600; cursor:pointer;">✕ Сбросить выбор сектора</button>
+                    </div>
+                    <div id="{uid}-p2-hdr" style="font-size:12px; color:#334155; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:6px 10px; margin-bottom:6px; text-align:center;"></div>
+                    <div id="{uid}-pie2" style="width:100%; height:{chart_h}px;"></div>
+                </div>
+            </div>
+            '''
+        else:
+            charts_area_html = f'''
+            <div style="border:1px solid #e2e8f0; border-radius:8px; padding:12px; background:#ffffff; box-sizing:border-box;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:6px;">
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        <button type="button" id="{uid}-back-btn" style="display:none; padding:4px 10px; border:1px solid #003F0B; border-radius:5px; background:#003F0B; color:#fff; font-weight:700; font-size:11.5px; cursor:pointer;">⬅ На уровень выше</button>
+                        <span id="{uid}-crumb" style="font-size:13px; font-weight:700; color:#003F0B;">Уровень 0: ДУТ и порог отклонения</span>
+                    </div>
+                    <label id="{uid}-rest-wrap" style="font-size:11.5px; color:#475569; cursor:pointer; display:flex; align-items:center; gap:4px;">
+                        <input type="checkbox" id="{uid}-show-rest" checked style="cursor:pointer;" /> Показать остаток (в норме)
+                    </label>
+                </div>
+                <div id="{uid}-p1-hdr" style="font-size:12.5px; color:#334155; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:6px 10px; margin-bottom:6px; text-align:center;"></div>
+                <div id="{uid}-pie1" style="width:100%; height:{chart_h + 30}px;"></div>
+            </div>
+            '''
+
+        js_code = r"""
+        <script>
+        (function() {
+            var uid = "__UID__";
+            var dataEl = document.getElementById(uid + "-dutdata");
+            if (!dataEl) return;
+            var cfg = JSON.parse(dataEl.textContent);
+
+            var state = {
+                dut: cfg.init.dut || "ALL",
+                op: cfg.init.op || "gt",
+                val: Number(cfg.init.val),
+                month: "ALL",
+                countMode: cfg.has_plate ? (cfg.init.count_mode || "unique_ts") : "rows",
+                showRest: true,
+                level: (cfg.mode === "dut_single_drill") ? 0 : 1,
+                pinnedDut: null,
+                pinnedMatched: true,
+                selType: "",
+                selModel: "",
+                _ready: false
+            };
+
+            function esc(s) {
+                return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            }
+
+            function opText(op, val) {
+                var vStr = Number(val).toFixed(1).replace(/\.0$/, "");
+                if (op === "gt") return "> " + vStr + "%";
+                if (op === "ge") return "≥ " + vStr + "%";
+                if (op === "lt") return "< " + vStr + "%";
+                if (op === "le") return "≤ " + vStr + "%";
+                if (op === "abs_gt") return "|%| > " + vStr + "%";
+                if (op === "abs_ge") return "|%| ≥ " + vStr + "%";
+                return "Все значения";
+            }
+
+            function checkPct(pct, op, val) {
+                if (op === "all") return true;
+                if (op === "gt") return pct > val;
+                if (op === "ge") return pct >= val;
+                if (op === "lt") return pct < val;
+                if (op === "le") return pct <= val;
+                if (op === "abs_gt") return Math.abs(pct) > val;
+                if (op === "abs_ge") return Math.abs(pct) >= val;
+                return true;
+            }
+
+            function buildEntities() {
+                var targetMonthIdx = -1;
+                if (state.month !== "ALL") {
+                    targetMonthIdx = cfg.dict_month.indexOf(state.month);
+                }
+                var raw = cfg.rows || [];
+                var out = [];
+
+                if (state.countMode === "unique_ts" && cfg.has_plate) {
+                    var map = {};
+                    for (var i = 0; i < raw.length; i++) {
+                        var r = raw[i];
+                        if (targetMonthIdx >= 0 && r[4] !== targetMonthIdx) continue;
+                        var key = r[0] + "|" + r[1] + "|" + r[2] + "|" + r[3];
+                        var item = map[key];
+                        if (!item) {
+                            item = { di: r[0], ti: r[1], mi: r[2], pi: r[3], f: 0, n: 0, ps: 0, c: 0 };
+                            map[key] = item;
+                        }
+                        item.f += r[5];
+                        item.n += r[6];
+                        item.ps += r[7];
+                        item.c += r[8];
+                    }
+                    var keys = Object.keys(map);
+                    for (var k = 0; k < keys.length; k++) {
+                        var it = map[keys[k]];
+                        var pct = cfg.use_pct_col
+                            ? (it.c > 0 ? it.ps / it.c : 0)
+                            : (Math.abs(it.n) > 1e-9 ? ((it.f - it.n) / it.n) * 100 : 0);
+                        out.push({
+                            dut: cfg.dict_dut[it.di] || "Не указано",
+                            type: cfg.dict_type[it.ti] || "Не указано",
+                            model: cfg.dict_model[it.mi] || "",
+                            plate: cfg.dict_plate[it.pi] || "",
+                            f: it.f, n: it.n, pct: pct, w: 1, rows: it.c,
+                            matched: checkPct(pct, state.op, state.val)
+                        });
+                    }
+                } else {
+                    for (var j = 0; j < raw.length; j++) {
+                        var rw = raw[j];
+                        if (targetMonthIdx >= 0 && rw[4] !== targetMonthIdx) continue;
+                        var pVal = cfg.use_pct_col
+                            ? (rw[8] > 0 ? rw[7] / rw[8] : 0)
+                            : (Math.abs(rw[6]) > 1e-9 ? ((rw[5] - rw[6]) / rw[6]) * 100 : 0);
+                        out.push({
+                            dut: cfg.dict_dut[rw[0]] || "Не указано",
+                            type: cfg.dict_type[rw[1]] || "Не указано",
+                            model: cfg.dict_model[rw[2]] || "",
+                            plate: cfg.dict_plate[rw[3]] || "",
+                            f: rw[5], n: rw[6], pct: pVal, w: rw[8], rows: rw[8],
+                            matched: checkPct(pVal, state.op, state.val)
+                        });
+                    }
+                }
+                return out;
+            }
+
+            function makeBaseLayout(h) {
+                return {
+                    height: h,
+                    margin: { l: 14, r: 14, t: 16, b: 16 },
+                    paper_bgcolor: cfg.bg_color || "#ffffff",
+                    plot_bgcolor: cfg.bg_color || "#ffffff",
+                    font: { family: "Segoe UI, Arial, sans-serif", size: cfg.font_size || 12, color: "#333" },
+                    showlegend: !!cfg.show_legend,
+                    legend: { orientation: "v", x: 1.02, y: 1.0, xanchor: "left", yanchor: "top", font: { size: Math.max(10, (cfg.font_size || 12) - 1) } },
+                    uniformtext: { minsize: 10, mode: "hide" }
+                };
+            }
+
+            function renderSummaryPie(divId, hdrId, entities, isSingleMode) {
+                var divEl = document.getElementById(divId);
+                if (!divEl) return;
+                var unitLbl = (state.countMode === "unique_ts" && cfg.has_plate) ? "об." : "зап.";
+                var condLbl = opText(state.op, state.val);
+
+                var scoped = entities.filter(function(e) {
+                    return state.dut === "ALL" || e.dut === state.dut;
+                });
+
+                var totalAll = 0;
+                var totalMatched = 0;
+                var byDutMatch = {};
+                var byDutRest = {};
+                cfg.dut_values.forEach(function(d) { byDutMatch[d] = 0; byDutRest[d] = 0; });
+
+                scoped.forEach(function(e) {
+                    totalAll += e.w;
+                    if (e.matched) {
+                        totalMatched += e.w;
+                        byDutMatch[e.dut] = (byDutMatch[e.dut] || 0) + e.w;
+                    } else {
+                        byDutRest[e.dut] = (byDutRest[e.dut] || 0) + e.w;
+                    }
+                });
+
+                var labels = [], values = [], colors = [], metaList = [], hoverHints = [], texts = [];
+                var matchPalette = ["#2b7fff", "#e11d48", "#87C800", "#ff9f1c", "#6f42c1"];
+                var restPalette = ["#cbd5e1", "#e2e8f0", "#d1d5db", "#e5e7eb"];
+                var drillHintText = "🖱 Кликните для разбивки на " + esc(cfg.labels.type);
+
+                var activeDuts = (state.dut === "ALL") ? cfg.dut_values : [state.dut];
+
+                if (state.op === "all") {
+                    activeDuts.forEach(function(d, idx) {
+                        var cnt = (byDutMatch[d] || 0) + (byDutRest[d] || 0);
+                        if (cnt <= 0) return;
+                        labels.push(cfg.labels.dut + ": " + d);
+                        values.push(cnt);
+                        colors.push(matchPalette[idx % matchPalette.length]);
+                        metaList.push({ kind: "summary", dut: d, matched: true });
+                        hoverHints.push(drillHintText);
+                        texts.push(cnt + " " + unitLbl);
+                    });
+                } else {
+                    activeDuts.forEach(function(d, idx) {
+                        var mCnt = byDutMatch[d] || 0;
+                        if (mCnt > 0) {
+                            labels.push(d + " (" + condLbl + ")");
+                            values.push(mCnt);
+                            colors.push(matchPalette[idx % matchPalette.length]);
+                            metaList.push({ kind: "summary", dut: d, matched: true });
+                            hoverHints.push(drillHintText);
+                            texts.push(mCnt + " " + unitLbl);
+                        }
+                    });
+                    if (state.showRest) {
+                        activeDuts.forEach(function(d, idx) {
+                            var rCnt = byDutRest[d] || 0;
+                            if (rCnt > 0) {
+                                labels.push(d + " (не подходят)");
+                                values.push(rCnt);
+                                colors.push(restPalette[idx % restPalette.length]);
+                                metaList.push({ kind: "summary", dut: d, matched: false });
+                                hoverHints.push(drillHintText);
+                                texts.push(rCnt + " " + unitLbl);
+                            }
+                        });
+                    }
+                }
+
+                var hdrEl = document.getElementById(hdrId);
+                if (hdrEl) {
+                    var pctM = totalAll > 0 ? (totalMatched / totalAll * 100).toFixed(1) : "0.0";
+                    var dutBreakdown = activeDuts.map(function(d) {
+                        return "«" + esc(d) + "»: <b>" + (byDutMatch[d] || 0) + "</b>";
+                    }).join(" | ");
+                    var sumHdrHtml =
+                        "Всего (" + esc(state.dut === "ALL" ? "Все" : state.dut) + "): <b>" + totalAll + " " + unitLbl + "</b>" +
+                        " &nbsp;|&nbsp; Подходят (<b>" + esc(condLbl) + "</b>): <b style='color:#003F0B;'>" + totalMatched + " " + unitLbl + " (" + pctM + "%)</b>" +
+                        (activeDuts.length > 1 ? " &nbsp;[" + dutBreakdown + "]" : "");
+                    if (state._ready && typeof window._eaUpdateHeaderAnimated === "function") {
+                        window._eaUpdateHeaderAnimated(hdrEl, sumHdrHtml);
+                    } else {
+                        hdrEl.innerHTML = sumHdrHtml;
+                    }
+                }
+
+                divEl._dutActiveMeta = metaList;
+
+                var trace = labels.length ? {
+                    type: "pie",
+                    labels: labels,
+                    values: values,
+                    customdata: hoverHints,
+                    hole: cfg.hole,
+                    marker: { colors: colors, line: { color: "#ffffff", width: 2 } },
+                    textinfo: cfg.show_values ? "value+percent" : "none",
+                    texttemplate: cfg.show_values ? "<b>%{value} " + unitLbl + "</b><br>(%{percent})" : "",
+                    textposition: "inside",
+                    insidetextorientation: "horizontal",
+                    sort: false,
+                    hovertemplate: "<b>%{label}</b><br>Количество: <b>%{value} " + unitLbl + "</b> (%{percent})<br><i style='color:#87C800;'>%{customdata}</i><extra></extra>"
+                } : {
+                    type: "pie",
+                    labels: ["Нет данных по условию"],
+                    values: [1],
+                    hole: cfg.hole,
+                    marker: { colors: ["#e2e8f0"] },
+                    textinfo: "label",
+                    hoverinfo: "skip",
+                    showlegend: false
+                };
+
+                var h = isSingleMode ? (cfg.height + 30) : cfg.height;
+                Plotly.react(divEl, [trace], makeBaseLayout(h), { responsive: true });
+                if (state._ready && typeof window._eaPlayElAnim === "function") {
+                    window._eaPlayElAnim(divEl, state._animDir || "fade");
+                }
+                bindPieClick(divEl);
+            }
+
+            function renderDetailPie(divId, hdrId, entities, isSingleMode) {
+                var divEl = document.getElementById(divId);
+                if (!divEl) return;
+                var unitLbl = (state.countMode === "unique_ts" && cfg.has_plate) ? "ТС" : "зап.";
+                var condLbl = opText(state.op, state.val);
+
+                var effDut = state.pinnedDut !== null ? state.pinnedDut : state.dut;
+                var effMatched = (state.op === "all") ? true : state.pinnedMatched;
+
+                var subset = entities.filter(function(e) {
+                    if (effDut !== "ALL" && e.dut !== effDut) return false;
+                    if (state.op !== "all" && e.matched !== effMatched) return false;
+                    if (state.level >= 2 && state.selType && e.type !== state.selType) return false;
+                    if (state.level >= 3 && state.selModel && e.model !== state.selModel) return false;
+                    return true;
+                });
+
+                var grpMap = {};
+                var totalWeight = 0;
+                subset.forEach(function(e) {
+                    var k = (state.level === 1) ? e.type : ((state.level === 2) ? (e.model || "Не указано") : (e.plate || "Не указано"));
+                    var g = grpMap[k];
+                    if (!g) {
+                        g = { name: k, w: 0, pctSumW: 0, f: 0, n: 0, rows: 0, duts: {} };
+                        grpMap[k] = g;
+                    }
+                    g.w += e.w;
+                    g.pctSumW += e.pct * e.w;
+                    g.f += e.f;
+                    g.n += e.n;
+                    g.rows += e.rows;
+                    g.duts[e.dut] = (g.duts[e.dut] || 0) + e.w;
+                    totalWeight += e.w;
+                });
+
+                var list = Object.keys(grpMap).map(function(k) {
+                    var g = grpMap[k];
+                    g.avgPct = g.w > 0 ? (g.pctSumW / g.w) : 0;
+                    return g;
+                });
+
+                if (state.level === 3 && state.countMode === "unique_ts" && cfg.has_plate) {
+                    list.sort(function(a, b) { return Math.abs(b.avgPct) - Math.abs(a.avgPct); });
+                } else {
+                    list.sort(function(a, b) { return b.w - a.w; });
+                }
+
+                var topN = Number(cfg.top_n || 15);
+                if (topN > 0 && list.length > topN) {
+                    var head = list.slice(0, topN);
+                    var tail = list.slice(topN);
+                    var other = { name: "Прочие (" + tail.length + ")", w: 0, pctSumW: 0, f: 0, n: 0, rows: 0, isOther: true };
+                    tail.forEach(function(t) {
+                        other.w += t.w;
+                        other.pctSumW += t.pctSumW;
+                        other.f += t.f;
+                        other.n += t.n;
+                        other.rows += t.rows;
+                    });
+                    other.avgPct = other.w > 0 ? (other.pctSumW / other.w) : 0;
+                    head.push(other);
+                    list = head;
+                }
+
+                var labels = [], values = [], colors = [], metaList = [], hoverBlocks = [], texts = [];
+                var isLevel3Unique = (state.level === 3 && state.countMode === "unique_ts" && cfg.has_plate);
+                var nextHint = "";
+                if (state.level === 1 && cfg.has_model) nextHint = "🖱 Кликните ➔ " + esc(cfg.labels.model);
+                else if (state.level === 1 && cfg.has_plate) nextHint = "🖱 Кликните ➔ " + esc(cfg.labels.plate);
+                else if (state.level === 2 && cfg.has_plate) nextHint = "🖱 Кликните ➔ " + esc(cfg.labels.plate);
+                else if (state.level === 3) nextHint = "🖱 Кликните для фильтрации таблицы данных";
+
+                list.forEach(function(g, idx) {
+                    labels.push(g.name);
+                    var valPlot = isLevel3Unique ? Math.max(0.01, Math.abs(g.avgPct)) : g.w;
+                    values.push(Number(valPlot.toFixed(2)));
+                    colors.push(g.isOther ? "#cbd5e1" : cfg.colors[idx % cfg.colors.length]);
+                    var pctStr = (g.avgPct >= 0 ? "+" : "") + g.avgPct.toFixed(2) + "%";
+                    var shareStr = totalWeight > 0 ? (g.w / totalWeight * 100).toFixed(1) + "%" : "0%";
+                    var fnInfo = cfg.has_fn ? ("<br>Факт: <b>" + g.f.toFixed(1) + "</b> | Норма: <b>" + g.n.toFixed(1) + "</b>") : "";
+                    var hintLine = (!g.isOther && nextHint) ? ("<br><i style='color:#87C800;'>" + nextHint + "</i>") : "";
+                    metaList.push({
+                        kind: "detail",
+                        name: g.name,
+                        isOther: !!g.isOther
+                    });
+                    hoverBlocks.push(
+                        "Количество: <b>" + g.w + " " + unitLbl + "</b> (" + shareStr + ")<br>" +
+                        esc(cfg.labels.pct) + ": <b>" + pctStr + "</b>" + fnInfo + hintLine
+                    );
+                    if (isLevel3Unique) {
+                        texts.push("<b>" + pctStr + "</b>");
+                    } else {
+                        texts.push("<b>" + g.w + " " + unitLbl + "</b><br>(" + shareStr + ")");
+                    }
+                });
+
+                // Обновляем хлебные крошки и шапку
+                var crumbEl = document.getElementById(uid + "-crumb");
+                var backBtn = document.getElementById(uid + "-back-btn");
+                var resetPinBtn = document.getElementById(uid + "-reset-pin");
+                var dutTag = (effDut === "ALL") ? "Все" : (cfg.labels.dut + ": " + effDut);
+                var condTag = (state.op === "all") ? "Все" : (effMatched ? condLbl : ("не подходят под " + condLbl));
+
+                if (backBtn) {
+                    var minLvl = isSingleMode ? 0 : 1;
+                    backBtn.style.display = (state.level > minLvl) ? "inline-block" : "none";
+                }
+                if (resetPinBtn) {
+                    resetPinBtn.style.display = (state.pinnedDut !== null || !state.pinnedMatched) ? "inline-block" : "none";
+                }
+                if (crumbEl) {
+                    if (state.level === 1) {
+                        crumbEl.innerHTML = "📂 Уровень 1 (" + esc(cfg.labels.type) + ")";
+                    } else if (state.level === 2) {
+                        crumbEl.innerHTML = "📂 " + esc(state.selType) + " ➔ Уровень 2 (" + esc(cfg.labels.model) + ")";
+                    } else {
+                        crumbEl.innerHTML = "📂 " + esc(state.selType) + (state.selModel ? (" ➔ " + esc(state.selModel)) : "") + " ➔ 🏷 Уровень 3 (" + esc(cfg.labels.plate) + ")";
+                    }
+                }
+
+                var hdrEl = document.getElementById(hdrId);
+                if (hdrEl) {
+                    var detHdrHtml =
+                        "Срез: <b>" + esc(dutTag) + "</b> | Условие: <b style='color:#003F0B;'>" + esc(condTag) + "</b>" +
+                        " &nbsp;|&nbsp; Всего в выборке: <b>" + totalWeight + " " + unitLbl + "</b> (групп: " + list.length + ")";
+                    if (state._ready && typeof window._eaUpdateHeaderAnimated === "function") {
+                        window._eaUpdateHeaderAnimated(hdrEl, detHdrHtml);
+                    } else {
+                        hdrEl.innerHTML = detHdrHtml;
+                    }
+                }
+
+                divEl._dutActiveMeta = metaList;
+
+                var trace = labels.length ? {
+                    type: "pie",
+                    labels: labels,
+                    values: values,
+                    text: texts,
+                    customdata: hoverBlocks,
+                    hole: cfg.hole,
+                    marker: { colors: colors, line: { color: "#ffffff", width: 1.5 } },
+                    textinfo: cfg.show_values ? "text" : "none",
+                    textposition: "inside",
+                    insidetextorientation: "horizontal",
+                    sort: false,
+                    hovertemplate: "<b>%{label}</b><br>%{customdata}<extra></extra>"
+                } : {
+                    type: "pie",
+                    labels: ["Нет записей, подходящих под условия"],
+                    values: [1],
+                    hole: cfg.hole,
+                    marker: { colors: ["#e2e8f0"] },
+                    textinfo: "label",
+                    hoverinfo: "skip",
+                    showlegend: false
+                };
+
+                var h = isSingleMode ? (cfg.height + 30) : cfg.height;
+                Plotly.react(divEl, [trace], makeBaseLayout(h), { responsive: true });
+                if (state._ready && typeof window._eaPlayElAnim === "function") {
+                    window._eaPlayElAnim(divEl, state._animDir || "fade");
+                }
+                bindPieClick(divEl);
+            }
+
+            function bindPieClick(divEl) {
+                if (!divEl || divEl._dutClickBound) return;
+                divEl._dutClickBound = true;
+                divEl.on("plotly_click", function(ev) {
+                    if (!ev || !ev.points || !ev.points.length) return;
+                    var pt = ev.points[0];
+                    var ptIdx = (pt.i !== undefined) ? pt.i : pt.pointNumber;
+                    var meta = divEl._dutActiveMeta ? divEl._dutActiveMeta[ptIdx] : null;
+                    if (!meta) return;
+
+                    if (meta.kind === "summary") {
+                        state.pinnedDut = meta.dut;
+                        state.pinnedMatched = !!meta.matched;
+                        state.selType = "";
+                        state.selModel = "";
+                        state.level = 1;
+                        state._animDir = "drill-in";
+                        renderAll();
+                    } else if (meta.kind === "detail" && !meta.isOther) {
+                        if (state.level === 1) {
+                            if (cfg.has_model) {
+                                state.selType = meta.name;
+                                state.selModel = "";
+                                state.level = 2;
+                                state._animDir = "drill-in";
+                                renderAll();
+                            } else if (cfg.has_plate) {
+                                state.selType = meta.name;
+                                state.selModel = "";
+                                state.level = 3;
+                                state._animDir = "drill-in";
+                                renderAll();
+                            }
+                        } else if (state.level === 2 && cfg.has_plate) {
+                            state.selModel = meta.name;
+                            state.level = 3;
+                            state._animDir = "drill-in";
+                            renderAll();
+                        } else if (state.level === 3 && typeof window.filterEaDataTable === "function") {
+                            window.filterEaDataTable("__ALL__", meta.name, true);
+                        }
+                    }
+                });
+            }
+
+            function syncControlStyles() {
+                var dutWrap = document.getElementById(uid + "-dutbar");
+                if (dutWrap) {
+                    dutWrap.querySelectorAll(".ea-dut-btn").forEach(function(b) {
+                        var active = b.getAttribute("data-dut") === state.dut;
+                        b.style.background = active ? "#87C800" : "#f8fafc";
+                        b.style.color = active ? "#ffffff" : "#334155";
+                        b.style.fontWeight = active ? "700" : "600";
+                    });
+                }
+                var mWrap = document.getElementById(uid + "-mbar");
+                if (mWrap) {
+                    mWrap.querySelectorAll(".ea-dut-mbtn").forEach(function(b) {
+                        var active = b.getAttribute("data-month") === state.month;
+                        b.style.background = active ? "#87C800" : "#f8fafc";
+                        b.style.color = active ? "#ffffff" : "#334155";
+                        b.style.fontWeight = active ? "700" : "500";
+                    });
+                }
+                var restWrap = document.getElementById(uid + "-rest-wrap");
+                if (restWrap) {
+                    restWrap.style.display = (state.level === 0) ? "flex" : "none";
+                }
+            }
+
+            function renderAll() {
+                if (typeof Plotly === "undefined") return;
+                syncControlStyles();
+                var entities = buildEntities();
+                if (cfg.mode === "dut_two_pies") {
+                    renderSummaryPie(uid + "-pie1", uid + "-p1-hdr", entities, false);
+                    renderDetailPie(uid + "-pie2", uid + "-p2-hdr", entities, false);
+                } else {
+                    if (state.level === 0) {
+                        var backBtn = document.getElementById(uid + "-back-btn");
+                        var crumbEl = document.getElementById(uid + "-crumb");
+                        if (backBtn) backBtn.style.display = "none";
+                        if (crumbEl) crumbEl.innerHTML = "📊 Уровень 0: " + esc(cfg.labels.dut) + " и " + esc(cfg.labels.pct);
+                        renderSummaryPie(uid + "-pie1", uid + "-p1-hdr", entities, true);
+                    } else {
+                        renderDetailPie(uid + "-pie1", uid + "-p1-hdr", entities, true);
+                    }
+                }
+                state._ready = true;
+                state._animDir = "fade";
+            }
+
+            // Подключаем кнопки ДУТ
+            var dutBar = document.getElementById(uid + "-dutbar");
+            if (dutBar) {
+                dutBar.querySelectorAll(".ea-dut-btn").forEach(function(btn) {
+                    btn.addEventListener("click", function() {
+                        state.dut = btn.getAttribute("data-dut") || "ALL";
+                        state.pinnedDut = null;
+                        state.pinnedMatched = true;
+                        state.selType = "";
+                        state.selModel = "";
+                        if (cfg.mode === "dut_two_pies") state.level = 1;
+                        renderAll();
+                    });
+                });
+            }
+
+            // Подключаем оператор и число % отклонения
+            var opSel = document.getElementById(uid + "-op-sel");
+            var valInp = document.getElementById(uid + "-val-inp");
+            if (opSel) {
+                opSel.value = state.op;
+                opSel.addEventListener("change", function() {
+                    state.op = opSel.value;
+                    if (valInp) valInp.disabled = (state.op === "all");
+                    renderAll();
+                });
+            }
+            if (valInp) {
+                valInp.value = String(state.val);
+                valInp.disabled = (state.op === "all");
+                valInp.addEventListener("input", function() {
+                    var parsed = parseFloat(String(valInp.value).replace(",", "."));
+                    if (!isNaN(parsed)) {
+                        state.val = parsed;
+                        renderAll();
+                    }
+                });
+            }
+
+            // Быстрые кнопки процентов (3%, 5%, 10%, 20%)
+            var pctQuick = document.getElementById(uid + "-pct-quick");
+            if (pctQuick) {
+                pctQuick.querySelectorAll("button").forEach(function(b) {
+                    b.addEventListener("click", function() {
+                        var v = parseFloat(b.getAttribute("data-v"));
+                        if (!isNaN(v)) {
+                            state.val = v;
+                            if (state.op === "all") {
+                                state.op = "gt";
+                                if (opSel) opSel.value = "gt";
+                            }
+                            if (valInp) {
+                                valInp.disabled = false;
+                                valInp.value = String(v);
+                            }
+                            renderAll();
+                        }
+                    });
+                });
+            }
+
+            // Переключатель Уникальные ТС / Все записи
+            var cntSel = document.getElementById(uid + "-cnt-sel");
+            if (cntSel) {
+                cntSel.addEventListener("change", function() {
+                    state.countMode = cntSel.value;
+                    renderAll();
+                });
+            }
+
+            // Галочка «Показать остаток (в норме)»
+            var chkRest = document.getElementById(uid + "-show-rest");
+            if (chkRest) {
+                chkRest.addEventListener("change", function() {
+                    state.showRest = !!chkRest.checked;
+                    renderAll();
+                });
+            }
+
+            // Кнопки месяцев
+            var mBar = document.getElementById(uid + "-mbar");
+            if (mBar) {
+                mBar.querySelectorAll(".ea-dut-mbtn").forEach(function(b) {
+                    b.addEventListener("click", function() {
+                        state.month = b.getAttribute("data-month") || "ALL";
+                        renderAll();
+                    });
+                });
+            }
+
+            // Кнопка «На уровень выше»
+            var backBtn = document.getElementById(uid + "-back-btn");
+            if (backBtn) {
+                backBtn.addEventListener("click", function() {
+                    if (state.level === 3) {
+                        state.selModel = "";
+                        state.level = cfg.has_model ? 2 : 1;
+                    } else if (state.level === 2) {
+                        state.selType = "";
+                        state.level = 1;
+                    } else if (state.level === 1 && cfg.mode === "dut_single_drill") {
+                        state.pinnedDut = null;
+                        state.pinnedMatched = true;
+                        state.level = 0;
+                    }
+                    state._animDir = "drill-out";
+                    renderAll();
+                });
+            }
+
+            // Кнопка сброса клика по сектору Левого круга
+            var resetPinBtn = document.getElementById(uid + "-reset-pin");
+            if (resetPinBtn) {
+                resetPinBtn.addEventListener("click", function() {
+                    state.pinnedDut = null;
+                    state.pinnedMatched = true;
+                    state.selType = "";
+                    state.selModel = "";
+                    state.level = 1;
+                    renderAll();
+                });
+            }
+
+            if (typeof Plotly !== "undefined") {
+                renderAll();
+            } else {
+                window.addEventListener("load", renderAll);
+            }
+        })();
+        </script>
+        """.replace("__UID__", uid)
+
+        dut_caption = _escape(str(self.title or "Диаграмма").strip() or "Диаграмма")
+        a_style = _escape(str(getattr(self, "anim_style", "auto") or "auto"))
+        a_speed = int(getattr(self, "anim_speed", 480) or 480)
+        inner = f'''
+        {_CHART_ANIM_ASSETS_HTML}
+        <div class="block" style="width:100%; min-width:0; max-width:100%;">
+            <div class="block-card ea-chart-card" id="{uid}-card"
+                 data-anim-style="{a_style}" data-anim-speed="{a_speed}"
+                 style="width:100%; padding:16px; background:{self.bg_color or '#ffffff'}; border-radius:8px; box-sizing:border-box; --ea-anim-dur:{a_speed}ms;">
+                <div class="ea-chart-topbar"
+                     onclick="if (this.parentElement.classList.contains('ea-collapsed')) window.toggleEaChartCard('{uid}', event)">
+                    <span class="ea-chart-collapsed-title">🥧 {dut_caption}<span class="ea-chart-collapsed-hint">(нажмите, чтобы развернуть)</span></span>
+                    <button type="button" class="ea-chart-toggle-btn" title="Свернуть график"
+                            onclick="window.toggleEaChartCard('{uid}', event)">
+                        <span class="ea-toggle-icon">▾</span>
+                    </button>
+                </div>
+                <div class="ea-chart-collapsible" id="{uid}-body">
+                    <div class="ea-chart-collapsible-inner">
+                        {title_html}
+                        <div style="display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; margin-bottom:10px;">
+                    <div id="{uid}-dutbar" style="display:flex; flex-wrap:wrap; align-items:center; gap:6px;">
+                        <span style="font-size:12px; font-weight:700; color:#003F0B;">🔌 {_escape(dut_col or 'Оснащён ДУТ')}:</span>
+                        {"".join(dut_btns_html)}
+                    </div>
+                    <div style="display:flex; flex-wrap:wrap; align-items:center; gap:6px;">
+                        <span style="font-size:12px; font-weight:700; color:#003F0B;" title="{_escape(' '.join(str(pct_col or '% отклонения').split()))}">📐 Отклонение:</span>
+                        <select id="{uid}-op-sel" style="padding:4px 8px; border:1px solid #87C800; border-radius:6px; font-size:12px; background:#fff; color:#1e293b; font-weight:600; cursor:pointer;">
+                            <option value="gt">&gt; Больше</option>
+                            <option value="ge">≥ Больше или равно</option>
+                            <option value="lt">&lt; Меньше</option>
+                            <option value="le">≤ Меньше или равно</option>
+                            <option value="abs_gt">|%| &gt; По модулю больше</option>
+                            <option value="abs_ge">|%| ≥ По модулю ≥</option>
+                            <option value="all">Все (без порога)</option>
+                        </select>
+                        <input type="number" id="{uid}-val-inp" step="0.5" value="{init_val}" style="width:74px; padding:4px 8px; border:1px solid #87C800; border-radius:6px; font-size:12px; font-weight:700; color:#003F0B; background:#fff;" />
+                        <span style="font-size:12px; font-weight:700; color:#334155;">%</span>
+                        <div id="{uid}-pct-quick" style="display:flex; gap:4px;">
+                            <button type="button" data-v="3" style="padding:3px 7px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#334155; font-size:11px; font-weight:600; cursor:pointer;">3%</button>
+                            <button type="button" data-v="5" style="padding:3px 7px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#334155; font-size:11px; font-weight:600; cursor:pointer;">5%</button>
+                            <button type="button" data-v="10" style="padding:3px 7px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#334155; font-size:11px; font-weight:600; cursor:pointer;">10%</button>
+                            <button type="button" data-v="20" style="padding:3px 7px; border:1px solid #cbd5e1; border-radius:4px; background:#fff; color:#334155; font-size:11px; font-weight:600; cursor:pointer;">20%</button>
+                        </div>
+                    </div>
+                    {count_mode_html}
+                </div>
+                {month_bar_html}
+                {charts_area_html}
+                <script type="application/json" id="{uid}-dutdata">{payload_json}</script>
+                {js_code}
+            </div>
+        </div>
+        '''
+        return self.wrap_layout(inner)
+
     def _render_empty(self, msg: str) -> str:
         return f'''
         <div class="block">
@@ -6686,10 +7826,9 @@ class DashboardFilterBlock(Block):
 
         primary_chart_id = raw_targets[0] if raw_targets else ""
 
-        if df_work is not None and self.filter_col and self.filter_col in df_work.columns:
-            filtered_df = df_work
+        if self.filter_col:
+            target_cfg = {}
             try:
-                target_cfg = {}
                 if report_obj and hasattr(report_obj, "sections"):
                     if raw_targets:
                         for cand_id in raw_targets:
@@ -6718,12 +7857,42 @@ class DashboardFilterBlock(Block):
                             if target_cfg:
                                 break
 
+                # 1. Если у фильтра указан привязанный график — проверяем его лист (приоритетно, если там есть filter_col)
                 if target_cfg:
+                    chart_df = None
                     if hasattr(report_obj, "get_block_dataframe"):
-                        chart_df = report_obj.get_block_dataframe(target_cfg, fallback_df=df_work)
-                        if chart_df is not None and self.filter_col in chart_df.columns:
-                            df_work = chart_df
+                        chart_df = report_obj.get_block_dataframe(target_cfg, fallback_df=None)
+                    if chart_df is None or self.filter_col not in chart_df.columns:
+                        tc_file = target_cfg.get("source_file_name", "")
+                        tc_sheet = target_cfg.get("source_sheet", "") or target_cfg.get("source_file", "")
+                        if tc_file or tc_sheet:
+                            chart_df = DataMemoryCache.get_dataframe(manager, tc_file, tc_sheet, fallback_df=None)
+                    if chart_df is not None and self.filter_col in chart_df.columns:
+                        df_work = chart_df
 
+                # 2. Если filter_col всё ещё нет в df_work — ищем лист с этой колонкой среди всех загруженных в FileManager
+                if (df_work is None or self.filter_col not in df_work.columns) and manager is not None:
+                    alt_df = None
+                    if hasattr(manager, "find_dataframe_with_column"):
+                        alt_df = manager.find_dataframe_with_column(self.filter_col)
+                    if alt_df is None and hasattr(manager, "get_files_dict"):
+                        for f_k, sh_list in (manager.get_files_dict() or {}).items():
+                            for s_k in (sh_list or []):
+                                cand_df = DataMemoryCache.get_dataframe(manager, f_k, s_k, fallback_df=None)
+                                if cand_df is not None and self.filter_col in cand_df.columns:
+                                    alt_df = cand_df
+                                    break
+                            if alt_df is not None:
+                                break
+                    if alt_df is not None:
+                        df_work = alt_df
+            except Exception as e:
+                print(f"[DashboardFilterBlock] Ошибка подбора источника данных: {e}")
+
+        if df_work is not None and self.filter_col and self.filter_col in df_work.columns:
+            filtered_df = df_work
+            try:
+                if target_cfg:
                     dummy_chart = PlotlyChartBlock(
                         id=primary_chart_id or "target",
                         type="plotly_chart",
@@ -6732,6 +7901,8 @@ class DashboardFilterBlock(Block):
                         filter_val=target_cfg.get("filter_val", ""),
                         custom_query=target_cfg.get("custom_query", ""),
                     )
+                    dummy_chart._report_ref = report_obj
+                    dummy_chart._file_manager = manager
                     filtered_df = dummy_chart._apply_smart_filter(df_work)
             except Exception as e:
                 print(f"[DashboardFilterBlock] Ошибка применения фильтра графика: {e}")
@@ -6841,27 +8012,20 @@ class DashboardFilterBlock(Block):
 
                     var mapEl = document.getElementById(plotDiv.id + '-rowmap');
                     if (mapEl) {
-                        try {
-                            var rowMap = JSON.parse(mapEl.textContent);
-                            if (rowMap && rowMap.__is_matrix__ && typeof window.syncMatrixPie === 'function') {
-                                plotDiv._activeGroup = value;
-                                window.syncMatrixPie(plotDiv);
-                                return;
-                            }
-                            var targetTraces = (value === 'ALL') ? rowMap['ALL'] : rowMap[value];
-                            if (!targetTraces && value !== 'ALL') {
-                                var normVal = String(value).trim().toLowerCase();
-                                Object.keys(rowMap).forEach(function(k) {
-                                    if (String(k).trim().toLowerCase() === normVal) {
-                                        targetTraces = rowMap[k];
-                                    }
-                                });
-                            }
-                            if (targetTraces) {
-                                window._eaRedrawPlotClean(plotDiv, targetTraces);
-                                return;
-                            }
-                        } catch (e) {}
+                        var rowMap = null;
+                        try { rowMap = JSON.parse(mapEl.textContent); } catch (e) {}
+                        if (rowMap && rowMap.__is_matrix__ && typeof window.syncMatrixPie === 'function') {
+                            // 1. Обязательно сбрасываем уровень погружения до 1 (корневой)
+                            plotDiv._activeLevel = 1;
+                            // 2. Устанавливаем новую группу 1-го уровня (Тип ТС)
+                            plotDiv._activeGroup = value;
+                            // 3. Жестко зачищаем 2-й и 3-й уровни
+                            plotDiv._activeSubGroup = '';
+                            delete plotDiv._activeSubGroup; 
+                            
+                            try { window.syncMatrixPie(plotDiv); } catch (e) { console.error(e); }
+                            return; // Выходим из функции, чтобы нижний код не сломал отрисовку
+                        }
                     }
                     if (!plotDiv._originalData) {
                         plotDiv._originalData = JSON.parse(JSON.stringify(plotDiv.data));

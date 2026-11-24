@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-10-26T17:09:57.562109",
+  "where": "Uncaught Exception (sys.excepthook)",
+  "exception_type": "NameError",
+  "exception_message": "name 'PivotDialog' is not defined",
+  "system": {
+    "python": "3.14.6 (tags/v3.14.6:c63aec6, Jun 10 2026, 10:26:10) [MSC v.1944 64 bit (AMD64)]",
+    "platform": "Windows-10-10.0.19045-SP0"
+  },
+  "crash_frame": {
+    "file": "C:\\Users\\v.ragimov\\excel-analyzer\\src\\ui\\main_window.py",
+    "line": 3028,
+    "function": "_on_pivot_open",
+    "locals": {
+      "self": "<src.ui.main_window.MainWindow(0x23391d29fd0) at 0x00000233B2371100>"
+    }
+  },
+  "traceback": "Traceback (most recent call last):\n  File \"C:\\Users\\v.ragimov\\excel-analyzer\\src\\ui\\main_window.py\", line 3028, in _on_pivot_open\n    dlg = PivotDialog(self.theme, self.current_data.dataframe, parent=self)\n          ^^^^^^^^^^^\nNameError: name 'PivotDialog' is not defined. Did you mean: 'SplitDialog'?\n",
+  "dataframe_info": {},
+  "report_state": {},
+  "extra": {}
+}

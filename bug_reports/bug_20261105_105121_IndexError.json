@@ -1,0 +1,32 @@
+{
+  "timestamp": "2026-11-05T10:51:21.092573",
+  "where": "Uncaught Exception (sys.excepthook)",
+  "exception_type": "IndexError",
+  "exception_message": "string index out of range",
+  "system": {
+    "python": "3.14.6 (tags/v3.14.6:c63aec6, Jun 10 2026, 10:26:10) [MSC v.1944 64 bit (AMD64)]",
+    "platform": "Windows-10-10.0.19045-SP0"
+  },
+  "crash_frame": {
+    "file": "C:\\Users\\v.ragimov\\excel-analyzer\\src\\ui\\visual_extract_widget.py",
+    "line": 141,
+    "function": "_on_clicked",
+    "locals": {
+      "self": "<src.ui.visual_extract_widget.VisualExtractWidget(0x28617661ed0) at 0x0000028641AC6580>",
+      "pos": "63",
+      "PHRASE_BREAKS": "',;\\t'",
+      "text": "'ПЛ автотранспорта АЛЦБ-000536 на 02.01.2026 19:10 - 03.01 15:00'",
+      "s": "0",
+      "i": "63"
+    }
+  },
+  "traceback": "Traceback (most recent call last):\n  File \"C:\\Users\\v.ragimov\\excel-analyzer\\src\\ui\\visual_extract_widget.py\", line 141, in _on_clicked\n    if text[i] in PHRASE_BREAKS:\n       ~~~~^^^\nIndexError: string index out of range\n",
+  "dataframe_info": {
+    "loaded": false
+  },
+  "report_state": {
+    "title": "Новый отчёт",
+    "sections": []
+  },
+  "extra": {}
+}

@@ -491,11 +491,31 @@ class ConstructorTab(QWidget):
             )
             return
 
-        file_name = "data.xlsx"
+        from src.core.code_generator import _extract_path_from_obj
+
+        file_name = ""
         sheet_name = 0
         if self.current_data is not None:
-            file_name = getattr(self.current_data, "filepath", None) or getattr(self.current_data, "file_path", "data.xlsx")
+            file_name = _extract_path_from_obj(self.current_data)
             sheet_name = getattr(self.current_data, "sheet_name", 0) or 0
+
+        if not file_name:
+            fm = getattr(self.report, "file_manager", None)
+            if fm is not None and hasattr(fm, "get_all"):
+                for entry in (fm.get_all() or []):
+                    cand = _extract_path_from_obj(entry) or _extract_path_from_obj(getattr(entry, "data", None))
+                    if cand:
+                        file_name = cand
+                        if not sheet_name:
+                            sheet_name = (
+                                getattr(entry, "sheet_name", 0)
+                                or getattr(getattr(entry, "data", None), "sheet_name", 0)
+                                or 0
+                            )
+                        break
+
+        if not file_name:
+            file_name = "data.xlsx"
 
         code = generate_report_script(
             report_model=self.report,
@@ -783,7 +803,7 @@ class ConstructorTab(QWidget):
             combo_kind = block_type.split(":", 1)[1]
             if combo_kind == "filter_line":
                 ch_cfg = _pin_source(_default_config("plotly_chart"))
-                ch_cfg.update({"chart_type": "line", "title": "Динамика Факт / Норматив", "width": 75})
+                ch_cfg.update({"chart_type": "line", "title": "Динамика показателей (А / Б)", "width": 75})
                 ch_block = ReportBlock.create("plotly_chart", ch_cfg)
 
                 fl_cfg = _pin_source(_default_config("dashboard_filter"))
@@ -813,10 +833,10 @@ class ConstructorTab(QWidget):
                     "target_chart": ch_block.id,
                     "text": (
                         "📊 Аналитический вывод ({{ group }} — {{ month }}):\n"
-                        "• Суммарный Факт: {{ fact }} | Норматив: {{ norm }} (записей: {{ count }})\n"
-                        "• Результат: {{ if(pct > 0; '⚠ Зафиксирован ПЕРЕРАСХОД на ' + abs_pct + '% (+' + abs_diff + ')'; "
-                        "if(pct < 0; '✅ Достигнута ЭКОНОМИЯ на ' + abs_pct + '% (-' + abs_diff + ')'; 'В пределах нормы (0%)')) }}\n"
-                        "• Наибольший вклад: {{ top_name }} (отклонение {{ top_pct }}%)"
+                        "• Показатель А: {{ fact }} | Показатель Б: {{ norm }} (записей: {{ count }})\n"
+                        "• Итог: {{ if(pct > 0; '⚠ Превышение на ' + abs_pct + '% (+' + abs_diff + ')'; "
+                        "if(pct < 0; '✅ Снижение на ' + abs_pct + '% (-' + abs_diff + ')'; 'В пределах базы (0%)')) }}\n"
+                        "• Лидер по вкладу: {{ top_name }} ({{ top_pct }}%)"
                     ),
                 })
                 p_block = ReportBlock.create("paragraph", p_cfg)
@@ -875,7 +895,7 @@ class ConstructorTab(QWidget):
         ):
             cfg["chart_type"] = sub_preset
             titles_map = {
-                "combo": "Комбинированный график (Факт / Норматив)",
+                "combo": "Комбинированный график",
                 "bar": "Столбчатая диаграмма",
                 "bar_stacked": "Накопительная гистограмма",
                 "bar_cumulative": "Накопительная с нарастающим итогом",
@@ -890,10 +910,10 @@ class ConstructorTab(QWidget):
         elif block_type == "paragraph" and sub_preset == "smart":
             cfg["text"] = (
                 "📊 Аналитический вывод ({{ group }} — {{ month }}):\n"
-                "• Суммарный Факт: {{ fact }} | Норматив: {{ norm }} (записей: {{ count }})\n"
-                "• Результат: {{ if(pct > 0; '⚠ Зафиксирован ПЕРЕРАСХОД на ' + abs_pct + '% (+' + abs_diff + ')'; "
-                "if(pct < 0; '✅ Достигнута ЭКОНОМИЯ на ' + abs_pct + '% (-' + abs_diff + ')'; 'В пределах нормы (0%)')) }}\n"
-                "• Наибольший вклад: {{ top_name }} (отклонение {{ top_pct }}%)"
+                "• Показатель А: {{ fact }} | Показатель Б: {{ norm }} (записей: {{ count }})\n"
+                "• Итог: {{ if(pct > 0; '⚠ Превышение на ' + abs_pct + '% (+' + abs_diff + ')'; "
+                "if(pct < 0; '✅ Снижение на ' + abs_pct + '% (-' + abs_diff + ')'; 'В пределах базы (0%)')) }}\n"
+                "• Лидер по вкладу: {{ top_name }} ({{ top_pct }}%)"
             )
             cfg["raw_html"] = False
 
@@ -1368,7 +1388,7 @@ def _default_config(block_type: str) -> dict:
         }
     if block_type == "data_table":
         return {
-            "title": "Реестр путевых листов",
+            "title": "Таблица данных",
             "max_rows": 20,
             "width": 100,
             "align": "left",

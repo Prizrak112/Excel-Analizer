@@ -1,0 +1,27 @@
+{
+  "timestamp": "2026-10-28T08:28:58.383724",
+  "where": "Uncaught Exception (sys.excepthook)",
+  "exception_type": "AttributeError",
+  "exception_message": "'BlockInspector' object has no attribute '_field_str'",
+  "system": {
+    "python": "3.14.6 (tags/v3.14.6:c63aec6, Jun 10 2026, 10:26:10) [MSC v.1944 64 bit (AMD64)]",
+    "platform": "Windows-10-10.0.19045-SP0"
+  },
+  "crash_frame": {
+    "file": "C:\\Users\\v.ragimov\\excel-analyzer\\src\\ui\\block_inspector.py",
+    "line": 407,
+    "function": "show_block",
+    "locals": {
+      "self": "<src.ui.block_inspector.BlockInspector(0x1741b890760) at 0x000001747DA10280>",
+      "block": "ReportBlock(id='0570c7df', type='decomposition', config={'width': 100, 'align': 'left', 'offset_x': 0, 'source_file_name': 'Факт с регламентом.xlsx', 'source_sheet': 'Полный отчёт'})",
+      "b_name": "'decomposition'",
+      "cfg": "{'width': 100, 'align': 'left', 'offset_x': 0, 'source_file_name': 'Факт с регламентом.xlsx', 'source_sheet': 'Полный отчёт'}",
+      "row_geo": "<PySide6.QtWidgets.QHBoxLayout(0x1741e62fd90) at 0x000001741E1F9A40>",
+      "cols": "['Месяц', 'Январь_ГСМ(регламент)', 'Январь_НормативныйРасходГСМ', 'Январь_ФактическийРасходГСМ', 'Январь_Пробег', 'Январь_Расход_glonas', 'Январь_Пробег_glonas', 'Февраль_ГСМ(регламент)', 'Февраль_НормативныйРасходГСМ', 'Февраль_ФактическийРасходГСМ', 'Февраль_Пробег', 'Февраль_Расход_glonas', 'Февраль_Пробег_glonas', 'Март_ГСМ(регламент)', 'Март_НормативныйРасходГСМ', 'Март_ФактическийРасходГСМ', 'Март_Пробег', 'Март_Расход_glonas', 'Март_Пробег_glonas', 'Апрель_ГСМ(регламент)', 'Апрель_Нормати"
+    }
+  },
+  "traceback": "Traceback (most recent call last):\n  File \"C:\\Users\\v.ragimov\\excel-analyzer\\src\\ui\\constructor_tab.py\", line 684, in _on_add_block\n    self._on_block_selected(block.id)\n    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^\n  File \"C:\\Users\\v.ragimov\\excel-analyzer\\src\\ui\\constructor_tab.py\", line 741, in _on_block_selected\n    self.inspector.show_block(block)\n    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^\n  File \"C:\\Users\\v.ragimov\\excel-analyzer\\src\\ui\\block_inspector.py\", line 407, in show_block\n    self._field_str(\"Заголовок графика\", \"title\", cfg)\n    ^^^^^^^^^^^^^^^\nAttributeError: 'BlockInspector' object has no attribute '_field_str'. Did you mean: '_field_int'?\n",
+  "dataframe_info": {},
+  "report_state": {},
+  "extra": {}
+}
